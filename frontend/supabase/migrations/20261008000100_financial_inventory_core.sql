@@ -1,0 +1,2116 @@
+-- Revive Junction additive ERP core migration.
+-- Apply only to a verified staging project first. This file is not executed by the frontend.
+-- It preserves existing rows; historical snapshots/balances are intentionally not backfilled.
+
+DO $preflight$
+DECLARE
+  v_purchase_stock_def text;
+  v_expense_automation_def text;
+BEGIN
+  IF to_regclass('public.phones') IS NULL
+     OR to_regclass('public.sales') IS NULL
+     OR to_regclass('public.customers') IS NULL
+     OR to_regclass('public.expenses') IS NULL
+     OR to_regclass('public.money_transactions') IS NULL
+     OR to_regclass('public.stock_movements') IS NULL
+     OR to_regclass('public.repairs') IS NULL
+     OR to_regclass('public.suppliers') IS NULL THEN
+    RAISE EXCEPTION 'Revive Junction migration stopped: one or more documented base tables are missing.';
+  END IF;
+
+  IF to_regprocedure('public.process_sale_automations()') IS NULL
+     OR to_regprocedure('public.process_phone_purchase_automations()') IS NULL
+     OR to_regprocedure('public.process_phone_purchase()') IS NULL
+     OR to_regprocedure('public.process_expense_automation()') IS NULL
+     OR to_regprocedure('public.sync_repair_cost()') IS NULL THEN
+    RAISE EXCEPTION 'Revive Junction migration stopped: expected existing automation functions were not found.';
+  END IF;
+
+  IF NOT EXISTS (
+       SELECT 1 FROM pg_trigger WHERE tgname = 'trg_process_sale_automations'
+         AND tgrelid = 'public.sales'::regclass AND NOT tgisinternal
+         AND tgfoid = 'public.process_sale_automations()'::regprocedure
+         AND (tgtype & 1) = 1 AND (tgtype & 2) = 0 AND (tgtype & 4) = 4
+     ) OR NOT EXISTS (
+       SELECT 1 FROM pg_trigger WHERE tgname = 'trg_process_phone_purchase_automations'
+         AND tgrelid = 'public.phones'::regclass AND NOT tgisinternal
+         AND tgfoid = 'public.process_phone_purchase_automations()'::regprocedure
+         AND (tgtype & 1) = 1 AND (tgtype & 2) = 0 AND (tgtype & 4) = 4
+     ) OR NOT EXISTS (
+       SELECT 1 FROM pg_trigger WHERE tgname = 'trg_phone_purchase_stock'
+         AND tgrelid = 'public.phones'::regclass AND NOT tgisinternal
+         AND tgfoid = 'public.process_phone_purchase()'::regprocedure
+         AND (tgtype & 1) = 1 AND (tgtype & 2) = 0 AND (tgtype & 4) = 4
+     ) OR NOT EXISTS (
+       SELECT 1 FROM pg_trigger WHERE tgname = 'trg_record_expense_money'
+         AND tgrelid = 'public.expenses'::regclass AND NOT tgisinternal
+         AND tgfoid = 'public.process_expense_automation()'::regprocedure
+         AND (tgtype & 1) = 1 AND (tgtype & 2) = 0 AND (tgtype & 4) = 4
+     ) OR NOT EXISTS (
+       SELECT 1 FROM pg_trigger WHERE tgname = 'trg_sync_repair_cost'
+         AND tgrelid = 'public.repairs'::regclass AND NOT tgisinternal
+         AND tgfoid = 'public.sync_repair_cost()'::regprocedure
+         AND (tgtype & 1) = 1 AND (tgtype & 4) = 4 AND (tgtype & 16) = 16
+     ) THEN
+    RAISE EXCEPTION 'Revive Junction migration stopped: a documented automation trigger is missing, has the wrong function, or has the wrong row/event timing.';
+  END IF;
+
+  IF EXISTS (
+    SELECT 1 FROM pg_trigger AS t
+    WHERE t.tgrelid IN ('public.phones'::regclass, 'public.sales'::regclass, 'public.expenses'::regclass, 'public.repairs'::regclass)
+      AND NOT t.tgisinternal
+      AND NOT (
+        (t.tgrelid = 'public.phones'::regclass AND t.tgname::text = ANY (ARRAY[
+          'trg_process_phone_purchase_automations', 'trg_phone_purchase_stock',
+          'trg_update_phone_updated_at', 'trg_validate_phone_imeis',
+          'trg_prepare_phone_purchase', 'trg_prevent_phone_status_during_repair',
+          'trg_guard_phone_lifecycle_update', 'trg_prevent_phone_delete', 'trg_audit_phones'
+        ]::text[]))
+        OR (t.tgrelid = 'public.sales'::regclass AND t.tgname::text = ANY (ARRAY[
+          'trg_process_sale_automations', 'trg_prepare_sale',
+          'trg_prevent_sale_delete', 'trg_audit_sales'
+        ]::text[]))
+        OR (t.tgrelid = 'public.expenses'::regclass AND t.tgname::text = ANY (ARRAY[
+          'trg_record_expense_money', 'trg_validate_expense_record', 'trg_audit_expenses'
+        ]::text[]))
+        OR (t.tgrelid = 'public.repairs'::regclass AND t.tgname::text = ANY (ARRAY[
+          'trg_sync_repair_cost', 'trg_prepare_repair_lifecycle',
+          'trg_finish_repair_lifecycle', 'trg_audit_repairs'
+        ]::text[]))
+      )
+  ) THEN
+    RAISE EXCEPTION 'Revive Junction migration stopped: an undocumented trigger exists on a core accounting or inventory table. Inspect it before applying this migration.';
+  END IF;
+
+  v_purchase_stock_def := lower(pg_get_functiondef('public.process_phone_purchase()'::regprocedure));
+  v_expense_automation_def := lower(pg_get_functiondef('public.process_expense_automation()'::regprocedure));
+  IF position('stock_movements' IN v_purchase_stock_def) = 0
+     OR position('money_transactions' IN v_purchase_stock_def) > 0 THEN
+    RAISE EXCEPTION 'Revive Junction migration stopped: the legacy purchase stock trigger is not stock-only; duplicate purchase accounting cannot be ruled out.';
+  END IF;
+  IF position('money_transactions' IN v_expense_automation_def) = 0 THEN
+    RAISE EXCEPTION 'Revive Junction migration stopped: the legacy expense trigger does not match the documented ledger automation.';
+  END IF;
+END;
+$preflight$;
+
+DO $schema_preflight$
+DECLARE
+  v_item record;
+  v_relation regclass;
+BEGIN
+  FOR v_item IN
+    SELECT * FROM (VALUES
+      ('phones', 'id'), ('phones', 'stock_code'), ('phones', 'status'),
+      ('phones', 'purchase_price'), ('phones', 'purchase_date'),
+      ('sales', 'id'), ('sales', 'phone_id'), ('sales', 'selling_price'),
+      ('sales', 'discount'), ('sales', 'payment_mode'), ('sales', 'invoice_no'),
+      ('sales', 'sale_date'),
+      ('customers', 'id'), ('customers', 'name'),
+      ('expenses', 'id'), ('expenses', 'amount'), ('expenses', 'category'),
+      ('expenses', 'expense_date'),
+      ('money_transactions', 'id'), ('money_transactions', 'transaction_type'),
+      ('money_transactions', 'amount'), ('money_transactions', 'category'),
+      ('money_transactions', 'payment_mode'), ('money_transactions', 'reference_id'),
+      ('money_transactions', 'transaction_date'),
+      ('stock_movements', 'id'), ('stock_movements', 'phone_id'),
+      ('stock_movements', 'movement_type'), ('stock_movements', 'quantity'),
+      ('repairs', 'id'), ('repairs', 'phone_id'), ('repairs', 'status'),
+      ('suppliers', 'id')
+    ) AS expected(table_name, column_name)
+  LOOP
+    v_relation := to_regclass(format('public.%I', v_item.table_name));
+    IF NOT EXISTS (
+      SELECT 1
+      FROM pg_catalog.pg_attribute AS a
+      WHERE a.attrelid = v_relation
+        AND a.attname = v_item.column_name
+        AND a.attnum > 0
+        AND NOT a.attisdropped
+    ) THEN
+      RAISE EXCEPTION 'Revive Junction migration stopped: required base column public.%.% is missing.',
+        v_item.table_name, v_item.column_name;
+    END IF;
+  END LOOP;
+
+  FOR v_item IN
+    SELECT * FROM (VALUES
+      ('phones', 'phones_status_check'),
+      ('sales', 'sales_payment_mode_check'),
+      ('repairs', 'repairs_status_check'),
+      ('stock_movements', 'stock_movements_movement_type_check')
+    ) AS expected(table_name, constraint_name)
+  LOOP
+    v_relation := to_regclass(format('public.%I', v_item.table_name));
+    IF NOT EXISTS (
+      SELECT 1
+      FROM pg_catalog.pg_constraint AS c
+      WHERE c.conrelid = v_relation
+        AND c.conname = v_item.constraint_name
+        AND c.contype = 'c'
+    ) THEN
+      RAISE EXCEPTION 'Revive Junction migration stopped: expected check constraint public.%.% is missing.',
+        v_item.table_name, v_item.constraint_name;
+    END IF;
+  END LOOP;
+
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_catalog.pg_index AS i
+    JOIN pg_catalog.pg_attribute AS a
+      ON a.attrelid = i.indrelid
+     AND a.attnum = i.indkey[0]
+     AND a.attname = 'invoice_no'
+     AND a.attnum > 0
+     AND NOT a.attisdropped
+    WHERE i.indrelid = 'public.sales'::regclass
+      AND i.indisunique
+      AND i.indisvalid
+      AND i.indisready
+      AND i.indnkeyatts = 1
+  ) THEN
+    RAISE EXCEPTION 'Revive Junction migration stopped: public.sales requires a valid unique index on invoice_no.';
+  END IF;
+END;
+$schema_preflight$;
+
+DO $policy_preflight$
+BEGIN
+  IF EXISTS (
+    SELECT 1
+    FROM pg_catalog.pg_policies AS p
+    WHERE p.schemaname = 'public'
+      AND p.tablename = ANY (ARRAY[
+        'phones', 'sales', 'customers', 'expenses', 'money_transactions',
+        'repairs', 'stock_movements', 'suppliers', 'customer_receivables',
+        'customer_collections', 'supplier_payables', 'supplier_payments',
+        'internal_transfers', 'sale_returns', 'audit_log', 'business_settings',
+        'account_opening_balances'
+      ]::name[])
+      AND p.policyname = p.tablename || '_deny_anon'
+      AND (
+        p.cmd <> 'ALL'
+        OR p.permissive <> 'RESTRICTIVE'
+        OR p.roles <> ARRAY['anon']::name[]
+        OR lower(btrim(COALESCE(p.qual, ''))) <> 'false'
+        OR lower(btrim(COALESCE(p.with_check, ''))) <> 'false'
+      )
+  ) THEN
+    RAISE EXCEPTION 'Revive Junction migration stopped: an existing anonymous-deny policy conflicts with the required restrictive definition.';
+  END IF;
+
+  IF EXISTS (
+    SELECT 1
+    FROM pg_catalog.pg_policies AS p
+    WHERE p.schemaname = 'public'
+      AND p.tablename IN ('phones', 'sales')
+      AND p.policyname = p.tablename || '_deny_delete'
+      AND (
+        p.cmd <> 'DELETE'
+        OR p.permissive <> 'RESTRICTIVE'
+        OR p.roles <> ARRAY['public']::name[]
+        OR lower(btrim(COALESCE(p.qual, ''))) <> 'false'
+      )
+  ) THEN
+    RAISE EXCEPTION 'Revive Junction migration stopped: an existing delete-denial policy conflicts with the required restrictive definition.';
+  END IF;
+END;
+$policy_preflight$;
+
+ALTER TABLE public.phones
+  ADD COLUMN IF NOT EXISTS purchase_payment_allocations jsonb NOT NULL DEFAULT '[]'::jsonb,
+  ADD COLUMN IF NOT EXISTS client_request_id uuid,
+  ADD COLUMN IF NOT EXISTS archived_at timestamptz,
+  ADD COLUMN IF NOT EXISTS archived_reason text;
+
+DO $phones_status_check$
+DECLARE
+  v_definition text;
+  v_check_expression text;
+  v_repair_allowed boolean;
+BEGIN
+  SELECT pg_get_constraintdef(oid, false)
+  INTO v_definition
+  FROM pg_constraint
+  WHERE conrelid = 'public.phones'::regclass
+    AND conname = 'phones_status_check'
+    AND contype = 'c';
+
+  IF FOUND THEN
+    v_check_expression := substring(v_definition FROM '^CHECK \((.*)\)$');
+    IF v_check_expression IS NULL THEN
+      RAISE EXCEPTION 'Unable to safely extend public.phones.phones_status_check to support repair lifecycle.';
+    END IF;
+
+    EXECUTE format(
+      'SELECT (%s)',
+      replace(v_check_expression, 'status', quote_literal('Repair'))
+    ) INTO v_repair_allowed;
+    IF v_repair_allowed IS DISTINCT FROM true THEN
+      ALTER TABLE public.phones DROP CONSTRAINT phones_status_check;
+      EXECUTE format(
+        'ALTER TABLE public.phones ADD CONSTRAINT phones_status_check CHECK ((%s) OR status = %L) NOT VALID',
+        v_check_expression,
+        'Repair'
+      );
+      ALTER TABLE public.phones VALIDATE CONSTRAINT phones_status_check;
+    END IF;
+  END IF;
+END;
+$phones_status_check$;
+
+DO $sales_payment_mode_check$
+DECLARE
+  v_definition text;
+  v_check_expression text;
+  v_required_modes constant text[] := ARRAY['Cash', 'UPI', 'Bank', 'Due', 'Mixed'];
+  v_missing_modes text[] := ARRAY[]::text[];
+  v_payment_mode text;
+  v_missing_values text;
+  v_mode_allowed boolean;
+BEGIN
+  SELECT pg_get_constraintdef(oid, false)
+  INTO v_definition
+  FROM pg_constraint
+  WHERE conrelid = 'public.sales'::regclass
+    AND conname = 'sales_payment_mode_check'
+    AND contype = 'c';
+
+  IF FOUND THEN
+    v_check_expression := substring(v_definition FROM '^CHECK \((.*)\)$');
+    IF v_check_expression IS NULL THEN
+      RAISE EXCEPTION 'Unable to safely extend public.sales.sales_payment_mode_check for sale payment modes.';
+    END IF;
+
+    FOREACH v_payment_mode IN ARRAY v_required_modes LOOP
+      EXECUTE format(
+        'SELECT (%s)',
+        replace(v_check_expression, 'payment_mode', quote_literal(v_payment_mode))
+      ) INTO v_mode_allowed;
+      IF v_mode_allowed IS DISTINCT FROM true THEN
+        v_missing_modes := array_append(v_missing_modes, v_payment_mode);
+      END IF;
+    END LOOP;
+
+    IF cardinality(v_missing_modes) > 0 THEN
+      SELECT string_agg(quote_literal(value), ', ' ORDER BY ordinal)
+      INTO v_missing_values
+      FROM unnest(v_missing_modes) WITH ORDINALITY AS missing(value, ordinal);
+
+      ALTER TABLE public.sales DROP CONSTRAINT sales_payment_mode_check;
+      EXECUTE format(
+        'ALTER TABLE public.sales ADD CONSTRAINT sales_payment_mode_check CHECK ((%s) OR payment_mode IN (%s)) NOT VALID',
+        v_check_expression,
+        v_missing_values
+      );
+      ALTER TABLE public.sales VALIDATE CONSTRAINT sales_payment_mode_check;
+    END IF;
+  END IF;
+END;
+$sales_payment_mode_check$;
+
+DO $stock_movement_type_check$
+DECLARE
+  v_definition text;
+  v_check_expression text;
+  v_required_types constant text[] := ARRAY[
+    'Purchase', 'Sale', 'Repair Out', 'Repair In', 'Return', 'Archive', 'Restore'
+  ];
+  v_missing_types text[] := ARRAY[]::text[];
+  v_movement_type text;
+  v_missing_values text;
+  v_type_allowed boolean;
+BEGIN
+  SELECT pg_get_constraintdef(oid, false)
+  INTO v_definition
+  FROM pg_constraint
+  WHERE conrelid = 'public.stock_movements'::regclass
+    AND conname = 'stock_movements_movement_type_check'
+    AND contype = 'c';
+
+  IF FOUND THEN
+    v_check_expression := substring(v_definition FROM '^CHECK \((.*)\)$');
+    IF v_check_expression IS NULL THEN
+      RAISE EXCEPTION 'Unable to safely extend public.stock_movements.stock_movements_movement_type_check for inventory workflows.';
+    END IF;
+
+    FOREACH v_movement_type IN ARRAY v_required_types LOOP
+      EXECUTE format(
+        'SELECT (%s)',
+        replace(v_check_expression, 'movement_type', quote_literal(v_movement_type))
+      ) INTO v_type_allowed;
+      IF v_type_allowed IS DISTINCT FROM true THEN
+        v_missing_types := array_append(v_missing_types, v_movement_type);
+      END IF;
+    END LOOP;
+
+    IF cardinality(v_missing_types) > 0 THEN
+      SELECT string_agg(quote_literal(value), ', ' ORDER BY ordinal)
+      INTO v_missing_values
+      FROM unnest(v_missing_types) WITH ORDINALITY AS missing(value, ordinal);
+
+      ALTER TABLE public.stock_movements
+        DROP CONSTRAINT stock_movements_movement_type_check;
+      EXECUTE format(
+        'ALTER TABLE public.stock_movements ADD CONSTRAINT stock_movements_movement_type_check CHECK ((%s) OR movement_type IN (%s)) NOT VALID',
+        v_check_expression,
+        v_missing_values
+      );
+      ALTER TABLE public.stock_movements
+        VALIDATE CONSTRAINT stock_movements_movement_type_check;
+    END IF;
+  END IF;
+END;
+$stock_movement_type_check$;
+
+ALTER TABLE public.sales
+  ADD COLUMN IF NOT EXISTS client_request_id uuid,
+  ADD COLUMN IF NOT EXISTS payment_allocations jsonb NOT NULL DEFAULT '[]'::jsonb,
+  ADD COLUMN IF NOT EXISTS purchase_cost_snapshot numeric,
+  ADD COLUMN IF NOT EXISTS repair_cost_snapshot numeric,
+  ADD COLUMN IF NOT EXISTS other_cost_snapshot numeric,
+  ADD COLUMN IF NOT EXISTS total_cost_snapshot numeric,
+  ADD COLUMN IF NOT EXISTS gross_profit_snapshot numeric,
+  ADD COLUMN IF NOT EXISTS margin_percent_snapshot numeric,
+  ADD COLUMN IF NOT EXISTS returned_at timestamptz;
+
+ALTER TABLE public.expenses
+  ADD COLUMN IF NOT EXISTS client_request_id uuid;
+
+ALTER TABLE public.repairs
+  ADD COLUMN IF NOT EXISTS client_request_id uuid,
+  ADD COLUMN IF NOT EXISTS phone_status_before_repair text;
+
+DO $repairs_status_check$
+DECLARE
+  v_definition text;
+  v_check_expression text;
+  v_required_statuses constant text[] := ARRAY[
+    'Pending', 'In Progress', 'Completed', 'Cancelled'
+  ];
+  v_missing_statuses text[] := ARRAY[]::text[];
+  v_repair_status text;
+  v_status_allowed boolean;
+  v_missing_values text;
+BEGIN
+  SELECT pg_get_constraintdef(oid, false)
+  INTO v_definition
+  FROM pg_constraint
+  WHERE conrelid = 'public.repairs'::regclass
+    AND conname = 'repairs_status_check'
+    AND contype = 'c';
+
+  IF FOUND THEN
+    v_check_expression := substring(v_definition FROM '^CHECK \((.*)\)$');
+    IF v_check_expression IS NULL THEN
+      RAISE EXCEPTION 'Unable to safely extend public.repairs.repairs_status_check for repair lifecycle.';
+    END IF;
+
+    FOREACH v_repair_status IN ARRAY v_required_statuses LOOP
+      EXECUTE format(
+        'SELECT (%s)',
+        replace(v_check_expression, 'status', quote_literal(v_repair_status))
+      ) INTO v_status_allowed;
+      IF v_status_allowed IS DISTINCT FROM true THEN
+        v_missing_statuses := array_append(v_missing_statuses, v_repair_status);
+      END IF;
+    END LOOP;
+
+    IF cardinality(v_missing_statuses) > 0 THEN
+      SELECT string_agg(quote_literal(value), ', ' ORDER BY ordinal)
+      INTO v_missing_values
+      FROM unnest(v_missing_statuses) WITH ORDINALITY AS missing(value, ordinal);
+
+      ALTER TABLE public.repairs DROP CONSTRAINT repairs_status_check;
+      EXECUTE format(
+        'ALTER TABLE public.repairs ADD CONSTRAINT repairs_status_check CHECK ((%s) OR status IN (%s)) NOT VALID',
+        v_check_expression,
+        v_missing_values
+      );
+      ALTER TABLE public.repairs VALIDATE CONSTRAINT repairs_status_check;
+    END IF;
+  END IF;
+END;
+$repairs_status_check$;
+
+CREATE SEQUENCE IF NOT EXISTS public.sales_invoice_seq;
+
+CREATE TABLE IF NOT EXISTS public.customer_receivables (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  sale_id uuid NOT NULL UNIQUE REFERENCES public.sales(id) ON DELETE RESTRICT,
+  customer_id uuid NOT NULL REFERENCES public.customers(id) ON DELETE RESTRICT,
+  original_amount numeric NOT NULL CHECK (original_amount > 0),
+  balance numeric NOT NULL CHECK (balance >= 0 AND balance <= original_amount),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  closed_at timestamptz
+);
+
+CREATE TABLE IF NOT EXISTS public.customer_collections (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  client_request_id uuid,
+  receivable_id uuid NOT NULL REFERENCES public.customer_receivables(id) ON DELETE RESTRICT,
+  customer_id uuid NOT NULL REFERENCES public.customers(id) ON DELETE RESTRICT,
+  amount numeric NOT NULL CHECK (amount > 0),
+  payment_mode text NOT NULL CHECK (payment_mode IN ('Cash', 'UPI', 'Bank')),
+  collection_date timestamptz NOT NULL DEFAULT now(),
+  notes text,
+  created_by uuid,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS public.supplier_payables (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  phone_id uuid NOT NULL UNIQUE REFERENCES public.phones(id) ON DELETE RESTRICT,
+  supplier_id uuid REFERENCES public.suppliers(id) ON DELETE RESTRICT,
+  payee_name text,
+  payee_phone text,
+  original_amount numeric NOT NULL CHECK (original_amount > 0),
+  balance numeric NOT NULL CHECK (balance >= 0 AND balance <= original_amount),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  closed_at timestamptz
+);
+
+CREATE TABLE IF NOT EXISTS public.supplier_payments (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  client_request_id uuid,
+  payable_id uuid NOT NULL REFERENCES public.supplier_payables(id) ON DELETE RESTRICT,
+  supplier_id uuid REFERENCES public.suppliers(id) ON DELETE RESTRICT,
+  amount numeric NOT NULL CHECK (amount > 0),
+  payment_mode text NOT NULL CHECK (payment_mode IN ('Cash', 'UPI', 'Bank')),
+  payment_date timestamptz NOT NULL DEFAULT now(),
+  notes text,
+  created_by uuid,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS public.internal_transfers (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  client_request_id uuid,
+  from_account text NOT NULL CHECK (from_account IN ('Cash', 'UPI', 'Bank')),
+  to_account text NOT NULL CHECK (to_account IN ('Cash', 'UPI', 'Bank')),
+  amount numeric NOT NULL CHECK (amount > 0),
+  transfer_date timestamptz NOT NULL DEFAULT now(),
+  notes text,
+  created_by uuid,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  CHECK (from_account <> to_account)
+);
+
+ALTER TABLE public.customer_collections ADD COLUMN IF NOT EXISTS client_request_id uuid;
+ALTER TABLE public.supplier_payments ADD COLUMN IF NOT EXISTS client_request_id uuid;
+ALTER TABLE public.internal_transfers ADD COLUMN IF NOT EXISTS client_request_id uuid;
+
+CREATE TABLE IF NOT EXISTS public.sale_returns (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  sale_id uuid NOT NULL UNIQUE REFERENCES public.sales(id) ON DELETE RESTRICT,
+  phone_id uuid NOT NULL REFERENCES public.phones(id) ON DELETE RESTRICT,
+  refund_amount numeric NOT NULL CHECK (refund_amount >= 0),
+  refund_allocations jsonb NOT NULL DEFAULT '[]'::jsonb,
+  return_date timestamptz NOT NULL DEFAULT now(),
+  notes text,
+  created_by uuid,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS public.audit_log (
+  id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  action text NOT NULL,
+  entity text NOT NULL,
+  entity_id text,
+  old_data jsonb,
+  new_data jsonb,
+  user_id uuid,
+  occurred_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS public.business_settings (
+  setting_key text PRIMARY KEY,
+  setting_value jsonb NOT NULL,
+  updated_by uuid,
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS public.account_opening_balances (
+  account text PRIMARY KEY CHECK (account IN ('Cash', 'UPI', 'Bank')),
+  opening_amount numeric NOT NULL CHECK (
+    opening_amount::text NOT IN ('NaN', 'Infinity', '-Infinity')
+    AND opening_amount = round(opening_amount, 2)
+    AND (account = 'Bank' OR opening_amount >= 0)
+  ),
+  opening_date timestamptz NOT NULL,
+  updated_by uuid,
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+
+INSERT INTO public.business_settings (setting_key, setting_value)
+VALUES
+  ('dead_stock_days', '60'::jsonb),
+  ('invoice_prefix', to_jsonb('RJ-'::text)),
+  ('default_warranty_days', '7'::jsonb),
+  ('business_name', to_jsonb('REVIVE JUNCTION'::text)),
+  ('owner_name', to_jsonb('Ankush Gupta'::text)),
+  ('business_phone', to_jsonb(''::text)),
+  ('business_address', to_jsonb('Near Sai Mandir, Birsinghpur Pali, Umaria, Madhya Pradesh'::text)),
+  ('currency', to_jsonb('INR'::text)),
+  ('default_payment_mode', to_jsonb('Cash'::text)),
+  ('expense_categories', '["Rent", "Electricity", "Tea & Snacks", "Salary", "Transport", "Marketing", "Maintenance", "Other"]'::jsonb),
+  ('phone_conditions', '["Flawless", "Superb", "Good", "Fair", "Damaged"]'::jsonb)
+ON CONFLICT (setting_key) DO NOTHING;
+
+CREATE INDEX IF NOT EXISTS customer_receivables_customer_balance_idx
+  ON public.customer_receivables (customer_id, balance) WHERE balance > 0;
+CREATE INDEX IF NOT EXISTS customer_collections_receivable_date_idx
+  ON public.customer_collections (receivable_id, collection_date);
+CREATE INDEX IF NOT EXISTS supplier_payables_supplier_balance_idx
+  ON public.supplier_payables (supplier_id, balance) WHERE balance > 0;
+CREATE INDEX IF NOT EXISTS supplier_payments_payable_date_idx
+  ON public.supplier_payments (payable_id, payment_date);
+CREATE INDEX IF NOT EXISTS phones_active_status_purchase_date_idx
+  ON public.phones (status, purchase_date) WHERE archived_at IS NULL;
+CREATE INDEX IF NOT EXISTS sales_customer_date_idx
+  ON public.sales (customer_id, sale_date DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS sales_client_request_id_uidx
+  ON public.sales (client_request_id) WHERE client_request_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS phones_client_request_id_uidx
+  ON public.phones (client_request_id) WHERE client_request_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS expenses_client_request_id_uidx
+  ON public.expenses (client_request_id) WHERE client_request_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS repairs_client_request_id_uidx
+  ON public.repairs (client_request_id) WHERE client_request_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS customer_collections_client_request_id_uidx
+  ON public.customer_collections (client_request_id) WHERE client_request_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS supplier_payments_client_request_id_uidx
+  ON public.supplier_payments (client_request_id) WHERE client_request_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS internal_transfers_client_request_id_uidx
+  ON public.internal_transfers (client_request_id) WHERE client_request_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS sales_phone_idx ON public.sales (phone_id);
+CREATE INDEX IF NOT EXISTS phones_brand_idx ON public.phones (brand);
+CREATE INDEX IF NOT EXISTS phones_stock_code_idx ON public.phones (stock_code);
+CREATE INDEX IF NOT EXISTS phones_supplier_idx ON public.phones (supplier_id);
+CREATE INDEX IF NOT EXISTS phones_imei_2_idx ON public.phones (imei_2) WHERE imei_2 IS NOT NULL;
+CREATE INDEX IF NOT EXISTS sales_date_idx ON public.sales (sale_date DESC);
+CREATE INDEX IF NOT EXISTS money_transactions_date_idx ON public.money_transactions (transaction_date DESC);
+CREATE INDEX IF NOT EXISTS money_transactions_type_mode_idx
+  ON public.money_transactions (transaction_type, payment_mode, transaction_date DESC);
+CREATE INDEX IF NOT EXISTS money_transactions_reference_idx ON public.money_transactions (reference_id);
+CREATE INDEX IF NOT EXISTS expenses_date_idx ON public.expenses (expense_date DESC);
+CREATE INDEX IF NOT EXISTS expenses_category_idx ON public.expenses (category);
+CREATE INDEX IF NOT EXISTS repairs_phone_status_idx ON public.repairs (phone_id, status);
+CREATE INDEX IF NOT EXISTS customers_phone_idx ON public.customers (phone);
+CREATE INDEX IF NOT EXISTS suppliers_phone_idx ON public.suppliers (phone);
+CREATE INDEX IF NOT EXISTS audit_log_entity_date_idx
+  ON public.audit_log (entity, occurred_at DESC);
+
+-- Add missing PostgREST relationships without scanning or rejecting historical orphan rows.
+DO $foreign_keys$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint c
+    WHERE c.contype = 'f' AND c.conrelid = 'public.sales'::regclass
+      AND c.confrelid = 'public.phones'::regclass
+      AND c.conkey = ARRAY[(SELECT attnum FROM pg_attribute WHERE attrelid = 'public.sales'::regclass AND attname = 'phone_id')]::smallint[]
+  ) THEN
+    ALTER TABLE public.sales ADD CONSTRAINT sales_phone_id_fkey
+      FOREIGN KEY (phone_id) REFERENCES public.phones(id) NOT VALID;
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint c
+    WHERE c.contype = 'f' AND c.conrelid = 'public.sales'::regclass
+      AND c.confrelid = 'public.customers'::regclass
+      AND c.conkey = ARRAY[(SELECT attnum FROM pg_attribute WHERE attrelid = 'public.sales'::regclass AND attname = 'customer_id')]::smallint[]
+  ) THEN
+    ALTER TABLE public.sales ADD CONSTRAINT sales_customer_id_fkey
+      FOREIGN KEY (customer_id) REFERENCES public.customers(id) NOT VALID;
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint c
+    WHERE c.contype = 'f' AND c.conrelid = 'public.phones'::regclass
+      AND c.confrelid = 'public.suppliers'::regclass
+      AND c.conkey = ARRAY[(SELECT attnum FROM pg_attribute WHERE attrelid = 'public.phones'::regclass AND attname = 'supplier_id')]::smallint[]
+  ) THEN
+    ALTER TABLE public.phones ADD CONSTRAINT phones_supplier_id_fkey
+      FOREIGN KEY (supplier_id) REFERENCES public.suppliers(id) NOT VALID;
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint c
+    WHERE c.contype = 'f' AND c.conrelid = 'public.repairs'::regclass
+      AND c.confrelid = 'public.phones'::regclass
+      AND c.conkey = ARRAY[(SELECT attnum FROM pg_attribute WHERE attrelid = 'public.repairs'::regclass AND attname = 'phone_id')]::smallint[]
+  ) THEN
+    ALTER TABLE public.repairs ADD CONSTRAINT repairs_phone_id_fkey
+      FOREIGN KEY (phone_id) REFERENCES public.phones(id) NOT VALID;
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint c
+    WHERE c.contype = 'f' AND c.conrelid = 'public.stock_movements'::regclass
+      AND c.confrelid = 'public.phones'::regclass
+      AND c.conkey = ARRAY[(SELECT attnum FROM pg_attribute WHERE attrelid = 'public.stock_movements'::regclass AND attname = 'phone_id')]::smallint[]
+  ) THEN
+    ALTER TABLE public.stock_movements ADD CONSTRAINT stock_movements_phone_id_fkey
+      FOREIGN KEY (phone_id) REFERENCES public.phones(id) NOT VALID;
+  END IF;
+END;
+$foreign_keys$;
+
+CREATE OR REPLACE FUNCTION public.normalize_payment_allocations(p_allocations jsonb, p_total numeric)
+RETURNS jsonb
+LANGUAGE plpgsql
+IMMUTABLE
+SET search_path = public, pg_temp
+AS $function$
+DECLARE
+  v_item jsonb;
+  v_account text;
+  v_amount numeric;
+  v_sum numeric := 0;
+  v_allowed constant text[] := ARRAY['Cash', 'UPI', 'Bank', 'Due'];
+BEGIN
+  IF p_total IS NULL OR p_total < 0 OR p_total::text IN ('NaN', 'Infinity', '-Infinity')
+     OR p_total <> round(p_total, 2) THEN
+    RAISE EXCEPTION 'Transaction total must be non-negative and have at most two decimal places.';
+  END IF;
+  IF p_allocations IS NULL OR jsonb_typeof(p_allocations) <> 'array' THEN
+    RAISE EXCEPTION 'Payment allocations must be a JSON array.';
+  END IF;
+
+  FOR v_item IN SELECT value FROM jsonb_array_elements(p_allocations) AS x(value) LOOP
+    v_account := v_item ->> 'account';
+    IF v_account IS NULL OR NOT (v_account = ANY(v_allowed)) THEN
+      RAISE EXCEPTION 'Unsupported payment account in allocation.';
+    END IF;
+    BEGIN
+      v_amount := (v_item ->> 'amount')::numeric;
+    EXCEPTION WHEN OTHERS THEN
+      RAISE EXCEPTION 'Each payment allocation requires a valid numeric amount.';
+    END;
+    IF v_amount <= 0 OR v_amount::text IN ('NaN', 'Infinity', '-Infinity')
+       OR v_amount <> round(v_amount, 2) THEN
+      RAISE EXCEPTION 'Payment allocations must be finite positive amounts with at most two decimal places.';
+    END IF;
+    v_sum := v_sum + v_amount;
+  END LOOP;
+
+  IF p_total = 0 AND v_sum = 0 THEN
+    RETURN '[]'::jsonb;
+  END IF;
+  IF v_sum <> p_total THEN
+    RAISE EXCEPTION 'Payment allocations must equal the transaction total.';
+  END IF;
+
+  RETURN (
+    SELECT COALESCE(
+      jsonb_agg(jsonb_build_object('account', account, 'amount', amount) ORDER BY account),
+      '[]'::jsonb
+    )
+    FROM (
+      SELECT item ->> 'account' AS account, SUM((item ->> 'amount')::numeric) AS amount
+      FROM jsonb_array_elements(p_allocations) AS x(item)
+      GROUP BY item ->> 'account'
+    ) AS grouped
+  );
+END;
+$function$;
+
+CREATE OR REPLACE FUNCTION public.payment_mode_for_allocations(p_allocations jsonb)
+RETURNS text
+LANGUAGE sql
+IMMUTABLE
+SET search_path = public, pg_temp
+AS $function$
+  SELECT CASE
+    WHEN jsonb_array_length(p_allocations) = 1 THEN p_allocations -> 0 ->> 'account'
+    WHEN jsonb_array_length(p_allocations) = 0 THEN 'Cash'
+    ELSE 'Mixed'
+  END;
+$function$;
+
+CREATE OR REPLACE FUNCTION public.cashbook_account_summary(p_start timestamptz, p_end timestamptz)
+RETURNS TABLE (
+  account text,
+  opening_balance numeric,
+  opening_balance_date timestamptz,
+  cash_in numeric,
+  cash_out numeric,
+  net_movement numeric,
+  closing_balance numeric
+)
+LANGUAGE plpgsql
+STABLE
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $function$
+BEGIN
+  IF auth.uid() IS NULL THEN RAISE EXCEPTION 'Sign in is required.'; END IF;
+  IF p_start IS NULL OR p_end IS NULL OR p_start >= p_end THEN
+    RAISE EXCEPTION 'A valid cashbook date range is required.';
+  END IF;
+  RETURN QUERY
+  WITH accounts(account_name) AS (VALUES ('Cash'::text), ('UPI'::text), ('Bank'::text))
+  SELECT
+    a.account_name,
+    CASE WHEN opening.account IS NULL OR opening.opening_date > p_start THEN NULL::numeric ELSE
+      opening.opening_amount + COALESCE(SUM(
+        CASE WHEN tx.transaction_type = 'Income' THEN tx.amount
+          WHEN tx.transaction_type = 'Expense' THEN -tx.amount ELSE 0 END
+      ) FILTER (WHERE tx.transaction_date < p_start), 0)
+    END AS opening_balance,
+    opening.opening_date,
+    COALESCE(SUM(tx.amount) FILTER (
+      WHERE tx.transaction_date >= p_start AND tx.transaction_type = 'Income'
+    ), 0) AS cash_in,
+    COALESCE(SUM(tx.amount) FILTER (
+      WHERE tx.transaction_date >= p_start AND tx.transaction_type = 'Expense'
+    ), 0) AS cash_out,
+    COALESCE(SUM(CASE WHEN tx.transaction_type = 'Income' THEN tx.amount
+      WHEN tx.transaction_type = 'Expense' THEN -tx.amount ELSE 0 END)
+      FILTER (WHERE tx.transaction_date >= p_start), 0) AS net_movement,
+    CASE WHEN opening.account IS NULL OR opening.opening_date >= p_end THEN NULL::numeric ELSE
+      opening.opening_amount + COALESCE(SUM(
+        CASE WHEN tx.transaction_type = 'Income' THEN tx.amount
+          WHEN tx.transaction_type = 'Expense' THEN -tx.amount ELSE 0 END
+      ), 0)
+    END AS closing_balance
+  FROM accounts AS a
+  LEFT JOIN public.account_opening_balances AS opening ON opening.account = a.account_name
+  LEFT JOIN public.money_transactions AS tx
+    ON tx.payment_mode = a.account_name
+    AND tx.transaction_date < p_end
+    AND (opening.opening_date IS NULL OR tx.transaction_date >= opening.opening_date)
+  GROUP BY a.account_name, opening.account, opening.opening_amount, opening.opening_date
+  ORDER BY a.account_name;
+END;
+$function$;
+
+CREATE OR REPLACE FUNCTION public.stamp_opening_balance_user()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $function$
+BEGIN
+  IF auth.uid() IS NULL THEN RAISE EXCEPTION 'Sign in is required.'; END IF;
+  NEW.updated_by := auth.uid();
+  NEW.updated_at := now();
+  RETURN NEW;
+END;
+$function$;
+
+DO $opening_balance_trigger$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'trg_stamp_opening_balance_user' AND tgrelid = 'public.account_opening_balances'::regclass AND NOT tgisinternal) THEN
+    CREATE TRIGGER trg_stamp_opening_balance_user
+      BEFORE INSERT OR UPDATE ON public.account_opening_balances
+      FOR EACH ROW EXECUTE FUNCTION public.stamp_opening_balance_user();
+  END IF;
+END;
+$opening_balance_trigger$;
+
+CREATE OR REPLACE FUNCTION public.validate_expense_record()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $function$
+BEGIN
+  IF NEW.amount IS NULL OR NEW.amount <= 0
+     OR NEW.amount::text IN ('NaN', 'Infinity', '-Infinity')
+     OR NEW.amount <> round(NEW.amount, 2) THEN
+    RAISE EXCEPTION 'Expense amount must be a positive value with at most two decimal places.';
+  END IF;
+  IF NEW.payment_mode NOT IN ('Cash', 'UPI', 'Bank') THEN
+    RAISE EXCEPTION 'Expense payment mode must be Cash, UPI, or Bank.';
+  END IF;
+  RETURN NEW;
+END;
+$function$;
+
+CREATE OR REPLACE FUNCTION public.validate_phone_imeis()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $function$
+DECLARE
+  v_imeis text[];
+  v_imei text;
+BEGIN
+  NEW.imei_1 := NULLIF(BTRIM(NEW.imei_1), '');
+  NEW.imei_2 := NULLIF(BTRIM(NEW.imei_2), '');
+  IF NEW.imei_1 IS NOT NULL AND NEW.imei_2 IS NOT NULL AND NEW.imei_1 = NEW.imei_2 THEN
+    RAISE EXCEPTION 'IMEI 1 and IMEI 2 must be different.';
+  END IF;
+
+  SELECT COALESCE(array_agg(imei ORDER BY imei), ARRAY[]::text[])
+  INTO v_imeis
+  FROM (
+    SELECT DISTINCT value AS imei
+    FROM unnest(ARRAY[NEW.imei_1, NEW.imei_2]) AS values_to_check(value)
+    WHERE value IS NOT NULL
+  ) AS unique_imeis;
+
+  FOREACH v_imei IN ARRAY v_imeis LOOP
+    PERFORM pg_advisory_xact_lock(hashtext(v_imei)::bigint);
+  END LOOP;
+
+  IF cardinality(v_imeis) > 0 AND EXISTS (
+    SELECT 1 FROM public.phones AS existing
+    WHERE existing.id IS DISTINCT FROM NEW.id
+      AND (existing.imei_1 = ANY(v_imeis) OR existing.imei_2 = ANY(v_imeis))
+  ) THEN
+    RAISE EXCEPTION 'This IMEI is already assigned to another phone.';
+  END IF;
+  RETURN NEW;
+END;
+$function$;
+
+DO $imei_validation_trigger$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'trg_validate_phone_imeis' AND tgrelid = 'public.phones'::regclass AND NOT tgisinternal) THEN
+    CREATE TRIGGER trg_validate_phone_imeis
+      BEFORE INSERT OR UPDATE OF imei_1, imei_2 ON public.phones
+      FOR EACH ROW EXECUTE FUNCTION public.validate_phone_imeis();
+  END IF;
+END;
+$imei_validation_trigger$;
+
+DO $expense_validation_trigger$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'trg_validate_expense_record' AND tgrelid = 'public.expenses'::regclass AND NOT tgisinternal) THEN
+    CREATE TRIGGER trg_validate_expense_record
+      BEFORE INSERT OR UPDATE OF amount, payment_mode ON public.expenses
+      FOR EACH ROW EXECUTE FUNCTION public.validate_expense_record();
+  END IF;
+END;
+$expense_validation_trigger$;
+
+CREATE OR REPLACE FUNCTION public.prepare_phone_purchase()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $function$
+DECLARE
+  v_total numeric;
+BEGIN
+  IF auth.uid() IS NULL THEN
+    RAISE EXCEPTION 'Sign in is required to record a phone purchase.';
+  END IF;
+  v_total := COALESCE(NEW.purchase_price, 0) + COALESCE(NEW.repair_cost, 0) + COALESCE(NEW.other_cost, 0);
+  NEW.purchase_payment_allocations := public.normalize_payment_allocations(
+    COALESCE(NEW.purchase_payment_allocations, '[]'::jsonb), v_total
+  );
+  IF NEW.purchase_price < 0 OR NEW.repair_cost < 0 OR NEW.other_cost < 0
+     OR NEW.purchase_price::text IN ('NaN', 'Infinity', '-Infinity')
+     OR NEW.repair_cost::text IN ('NaN', 'Infinity', '-Infinity')
+     OR NEW.other_cost::text IN ('NaN', 'Infinity', '-Infinity')
+     OR NEW.purchase_price <> round(NEW.purchase_price, 2)
+     OR NEW.repair_cost <> round(NEW.repair_cost, 2)
+     OR NEW.other_cost <> round(NEW.other_cost, 2)
+     OR (NEW.expected_selling_price IS NOT NULL AND (
+       NEW.expected_selling_price < 0
+       OR NEW.expected_selling_price::text IN ('NaN', 'Infinity', '-Infinity')
+       OR NEW.expected_selling_price <> round(NEW.expected_selling_price, 2)
+     )) THEN
+    RAISE EXCEPTION 'Purchase, repair, other, and expected sale values must be finite non-negative amounts with at most two decimal places.';
+  END IF;
+  IF EXISTS (
+    SELECT 1 FROM jsonb_array_elements(NEW.purchase_payment_allocations) AS x(item)
+    WHERE item ->> 'account' = 'Due'
+  ) AND NEW.supplier_id IS NULL AND NULLIF(BTRIM(NEW.seller_name), '') IS NULL THEN
+    RAISE EXCEPTION 'A supplier or seller is required when recording a purchase due.';
+  END IF;
+  RETURN NEW;
+END;
+$function$;
+
+DO $trigger$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'trg_prepare_phone_purchase' AND tgrelid = 'public.phones'::regclass AND NOT tgisinternal) THEN
+    CREATE TRIGGER trg_prepare_phone_purchase
+      BEFORE INSERT ON public.phones
+      FOR EACH ROW EXECUTE FUNCTION public.prepare_phone_purchase();
+  END IF;
+END;
+$trigger$;
+
+CREATE OR REPLACE FUNCTION public.process_phone_purchase_automations()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $function$
+DECLARE
+  v_total numeric;
+  v_item jsonb;
+  v_account text;
+  v_amount numeric;
+  v_payee_name text;
+  v_payee_phone text;
+BEGIN
+  IF TG_OP <> 'INSERT' THEN RETURN NEW; END IF;
+  v_total := COALESCE(NEW.purchase_price, 0) + COALESCE(NEW.repair_cost, 0) + COALESCE(NEW.other_cost, 0);
+  IF v_total <= 0 THEN
+    RETURN NEW;
+  END IF;
+
+  SELECT s.name, s.phone INTO v_payee_name, v_payee_phone
+  FROM public.suppliers AS s WHERE s.id = NEW.supplier_id;
+  v_payee_name := COALESCE(v_payee_name, NEW.seller_name);
+  v_payee_phone := COALESCE(v_payee_phone, NEW.seller_phone);
+
+  FOR v_item IN SELECT value FROM jsonb_array_elements(NEW.purchase_payment_allocations) AS x(value) LOOP
+    v_account := v_item ->> 'account';
+    v_amount := (v_item ->> 'amount')::numeric;
+    IF v_account = 'Due' THEN
+      INSERT INTO public.supplier_payables (
+        phone_id, supplier_id, payee_name, payee_phone, original_amount, balance
+      ) VALUES (
+        NEW.id, NEW.supplier_id, v_payee_name, v_payee_phone, v_amount, v_amount
+      );
+    ELSE
+      INSERT INTO public.money_transactions (
+        transaction_type, category, amount, payment_mode, reference_id, transaction_date, notes
+      ) VALUES (
+        'Expense', 'Mobile Purchase', v_amount, v_account, NEW.id, NEW.purchase_date,
+        CONCAT('Automatic purchase entry: ', NEW.brand, ' ', NEW.model)
+      );
+    END IF;
+  END LOOP;
+  RETURN NEW;
+END;
+$function$;
+
+CREATE OR REPLACE FUNCTION public.create_phone_purchase_atomic(p_payload jsonb)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $function$
+DECLARE
+  v_id uuid := gen_random_uuid();
+  v_now timestamptz := now();
+  v_stock_code text := NULLIF(BTRIM(p_payload ->> 'stock_code'), '');
+  v_brand text := NULLIF(BTRIM(p_payload ->> 'brand'), '');
+  v_model text := NULLIF(BTRIM(p_payload ->> 'model'), '');
+  v_purchase numeric;
+  v_repair numeric;
+  v_other numeric;
+  v_expected numeric;
+  v_purchase_date timestamptz;
+  v_supplier_id uuid;
+  v_request_id uuid;
+  v_phone public.phones%ROWTYPE;
+BEGIN
+  IF auth.uid() IS NULL THEN RAISE EXCEPTION 'Sign in is required.'; END IF;
+  BEGIN
+    v_request_id := NULLIF(p_payload ->> 'client_request_id', '')::uuid;
+  EXCEPTION WHEN OTHERS THEN
+    RAISE EXCEPTION 'Phone purchase request ID is invalid.';
+  END;
+  IF v_request_id IS NULL THEN RAISE EXCEPTION 'Phone purchase request ID is required.'; END IF;
+  PERFORM pg_advisory_xact_lock(hashtext(v_request_id::text)::bigint);
+  SELECT * INTO v_phone FROM public.phones WHERE client_request_id = v_request_id;
+  IF FOUND THEN
+    RETURN jsonb_build_object('phone_id', v_phone.id, 'stock_code', v_phone.stock_code);
+  END IF;
+  IF v_stock_code IS NULL OR v_brand IS NULL OR v_model IS NULL THEN
+    RAISE EXCEPTION 'Stock code, brand, and model are required.';
+  END IF;
+  BEGIN
+    v_purchase := COALESCE(NULLIF(p_payload ->> 'purchase_price', '')::numeric, 0);
+    v_repair := COALESCE(NULLIF(p_payload ->> 'repair_cost', '')::numeric, 0);
+    v_other := COALESCE(NULLIF(p_payload ->> 'other_cost', '')::numeric, 0);
+    v_expected := NULLIF(p_payload ->> 'expected_selling_price', '')::numeric;
+    v_purchase_date := COALESCE(NULLIF(p_payload ->> 'purchase_date', '')::timestamptz, v_now);
+    v_supplier_id := NULLIF(p_payload ->> 'supplier_id', '')::uuid;
+  EXCEPTION WHEN OTHERS THEN
+    RAISE EXCEPTION 'Phone purchase contains an invalid date, amount, or supplier.';
+  END;
+  IF v_purchase < 0 OR v_repair < 0 OR v_other < 0 OR COALESCE(v_expected, 0) < 0
+     OR v_purchase::text IN ('NaN', 'Infinity', '-Infinity')
+     OR v_repair::text IN ('NaN', 'Infinity', '-Infinity')
+     OR v_other::text IN ('NaN', 'Infinity', '-Infinity')
+     OR (v_expected IS NOT NULL AND (
+       v_expected::text IN ('NaN', 'Infinity', '-Infinity')
+       OR v_expected <> round(v_expected, 2)
+     )) THEN
+    RAISE EXCEPTION 'Phone costs and expected selling price must be finite non-negative amounts with at most two decimal places.';
+  END IF;
+
+  INSERT INTO public.phones (
+    id, client_request_id, stock_code, brand, model, variant, imei_1, imei_2, storage, ram, condition,
+    purchase_price, repair_cost, other_cost, expected_selling_price, purchase_date,
+    status, supplier_id, seller_name, seller_phone, seller_photo_url, id_proof_front_url,
+    id_proof_back_url, notes, purchase_payment_allocations, created_at, updated_at
+  ) VALUES (
+    v_id, v_request_id, v_stock_code, v_brand, v_model, NULLIF(BTRIM(p_payload ->> 'variant'), ''),
+    NULLIF(BTRIM(p_payload ->> 'imei_1'), ''), NULLIF(BTRIM(p_payload ->> 'imei_2'), ''),
+    NULLIF(BTRIM(p_payload ->> 'storage'), ''), NULLIF(BTRIM(p_payload ->> 'ram'), ''),
+    COALESCE(NULLIF(BTRIM(p_payload ->> 'condition'), ''), 'Good'),
+    v_purchase, v_repair, v_other, v_expected, v_purchase_date, 'Available', v_supplier_id,
+    NULLIF(BTRIM(p_payload ->> 'seller_name'), ''), NULLIF(BTRIM(p_payload ->> 'seller_phone'), ''),
+    NULLIF(p_payload ->> 'seller_photo_url', ''), NULLIF(p_payload ->> 'id_proof_front_url', ''),
+    NULLIF(p_payload ->> 'id_proof_back_url', ''), NULLIF(BTRIM(p_payload ->> 'notes'), ''),
+    COALESCE(p_payload -> 'purchase_payment_allocations', '[]'::jsonb), v_now, v_now
+  ) RETURNING * INTO v_phone;
+
+  RETURN jsonb_build_object('phone_id', v_phone.id, 'stock_code', v_phone.stock_code);
+END;
+$function$;
+
+CREATE OR REPLACE FUNCTION public.create_expense_atomic(
+  p_request_id uuid, p_category text, p_amount numeric, p_payment_mode text,
+  p_expense_date timestamptz, p_description text
+)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $function$
+DECLARE
+  v_expense_id uuid;
+BEGIN
+  IF auth.uid() IS NULL THEN RAISE EXCEPTION 'Sign in is required.'; END IF;
+  IF p_request_id IS NULL THEN RAISE EXCEPTION 'Transaction request ID is required.'; END IF;
+  SELECT id INTO v_expense_id FROM public.expenses WHERE client_request_id = p_request_id;
+  IF FOUND THEN RETURN jsonb_build_object('expense_id', v_expense_id); END IF;
+  IF NULLIF(BTRIM(p_category), '') IS NULL THEN RAISE EXCEPTION 'Expense category is required.'; END IF;
+  INSERT INTO public.expenses (client_request_id, amount, category, description, payment_mode, expense_date)
+  VALUES (p_request_id, p_amount, BTRIM(p_category), NULLIF(BTRIM(p_description), ''), p_payment_mode, COALESCE(p_expense_date, now()))
+  ON CONFLICT (client_request_id) WHERE client_request_id IS NOT NULL DO NOTHING
+  RETURNING id INTO v_expense_id;
+  IF v_expense_id IS NULL THEN
+    SELECT id INTO v_expense_id FROM public.expenses WHERE client_request_id = p_request_id;
+  END IF;
+  RETURN jsonb_build_object('expense_id', v_expense_id);
+END;
+$function$;
+
+CREATE OR REPLACE FUNCTION public.prepare_sale()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $function$
+DECLARE
+  v_phone public.phones%ROWTYPE;
+  v_net numeric;
+  v_allocations jsonb;
+BEGIN
+  IF auth.uid() IS NULL THEN RAISE EXCEPTION 'Sign in is required to record a sale.'; END IF;
+  IF NEW.selling_price <= 0 OR NEW.discount < 0 OR NEW.discount >= NEW.selling_price
+     OR NEW.selling_price <> round(NEW.selling_price, 2)
+     OR NEW.discount <> round(NEW.discount, 2) THEN
+    RAISE EXCEPTION 'Sale price or discount must be valid amounts with at most two decimal places.';
+  END IF;
+  SELECT * INTO v_phone FROM public.phones WHERE id = NEW.phone_id FOR UPDATE;
+  IF NOT FOUND OR v_phone.status <> 'Available' OR v_phone.archived_at IS NOT NULL THEN
+    RAISE EXCEPTION 'This phone is no longer available for sale.';
+  END IF;
+  IF EXISTS (
+    SELECT 1 FROM public.repairs
+    WHERE phone_id = NEW.phone_id AND lower(status) IN ('pending', 'in progress')
+  ) THEN
+    RAISE EXCEPTION 'This phone has an active repair and cannot be sold yet.';
+  END IF;
+
+  v_net := NEW.selling_price - NEW.discount;
+  v_allocations := COALESCE(NEW.payment_allocations, '[]'::jsonb);
+  IF jsonb_array_length(v_allocations) = 0 THEN
+    IF NEW.payment_mode IN ('Cash', 'UPI', 'Bank') THEN
+      v_allocations := jsonb_build_array(jsonb_build_object('account', NEW.payment_mode, 'amount', v_net));
+    ELSIF NEW.payment_mode = 'Due' THEN
+      v_allocations := jsonb_build_array(jsonb_build_object('account', 'Due', 'amount', v_net));
+    ELSE
+      RAISE EXCEPTION 'Mixed sale payments require explicit payment allocations.';
+    END IF;
+  END IF;
+  NEW.payment_allocations := public.normalize_payment_allocations(v_allocations, v_net);
+  NEW.payment_mode := public.payment_mode_for_allocations(NEW.payment_allocations);
+  IF EXISTS (
+    SELECT 1 FROM jsonb_array_elements(NEW.payment_allocations) AS x(item)
+    WHERE item ->> 'account' = 'Due'
+  ) AND NEW.customer_id IS NULL THEN
+    RAISE EXCEPTION 'A customer is required when any sale amount is due.';
+  END IF;
+
+  NEW.purchase_cost_snapshot := v_phone.purchase_price;
+  NEW.repair_cost_snapshot := v_phone.repair_cost;
+  NEW.other_cost_snapshot := v_phone.other_cost;
+  NEW.total_cost_snapshot := COALESCE(v_phone.purchase_price, 0)
+    + COALESCE(v_phone.repair_cost, 0) + COALESCE(v_phone.other_cost, 0);
+  NEW.gross_profit_snapshot := v_net - NEW.total_cost_snapshot;
+  NEW.margin_percent_snapshot := (NEW.gross_profit_snapshot / v_net) * 100;
+  RETURN NEW;
+END;
+$function$;
+
+DO $trigger$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'trg_prepare_sale' AND tgrelid = 'public.sales'::regclass AND NOT tgisinternal) THEN
+    CREATE TRIGGER trg_prepare_sale
+      BEFORE INSERT ON public.sales
+      FOR EACH ROW EXECUTE FUNCTION public.prepare_sale();
+  END IF;
+END;
+$trigger$;
+
+CREATE OR REPLACE FUNCTION public.process_sale_automations()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $function$
+DECLARE
+  v_item jsonb;
+  v_account text;
+  v_amount numeric;
+  v_due numeric := 0;
+  v_previous_lifecycle_setting text;
+BEGIN
+  IF TG_OP <> 'INSERT' THEN RETURN NEW; END IF;
+  v_previous_lifecycle_setting := current_setting('rj.lifecycle_write', true);
+  PERFORM set_config('rj.lifecycle_write', 'on', true);
+  UPDATE public.phones
+  SET status = 'Sold', updated_at = now()
+  WHERE id = NEW.phone_id AND status = 'Available' AND archived_at IS NULL;
+  IF NOT FOUND THEN RAISE EXCEPTION 'Phone availability changed while recording the sale.'; END IF;
+  PERFORM set_config('rj.lifecycle_write', COALESCE(v_previous_lifecycle_setting, ''), true);
+
+  FOR v_item IN SELECT value FROM jsonb_array_elements(NEW.payment_allocations) AS x(value) LOOP
+    v_account := v_item ->> 'account';
+    v_amount := (v_item ->> 'amount')::numeric;
+    IF v_account = 'Due' THEN
+      v_due := v_due + v_amount;
+    ELSE
+      INSERT INTO public.money_transactions (
+        transaction_type, category, amount, payment_mode, reference_id, transaction_date, notes
+      ) VALUES (
+        'Income', 'Mobile Sale', v_amount, v_account, NEW.id, NEW.sale_date,
+        'Automatic entry from mobile sale'
+      );
+    END IF;
+  END LOOP;
+
+  IF v_due > 0 THEN
+    INSERT INTO public.customer_receivables (sale_id, customer_id, original_amount, balance)
+    VALUES (NEW.id, NEW.customer_id, v_due, v_due);
+  END IF;
+
+  INSERT INTO public.stock_movements (
+    phone_id, movement_type, quantity, reference_id, movement_date, notes
+  ) VALUES (
+    NEW.phone_id, 'Sale', -1, NEW.id, NEW.sale_date, 'Automatic stock movement from sale'
+  );
+  RETURN NEW;
+END;
+$function$;
+
+CREATE OR REPLACE FUNCTION public.create_sale_atomic(
+  p_phone_id uuid,
+  p_customer_id uuid,
+  p_customer_name text,
+  p_customer_phone text,
+  p_selling_price numeric,
+  p_discount numeric,
+  p_payment_allocations jsonb,
+  p_sale_date timestamptz,
+  p_warranty_days integer,
+  p_notes text,
+  p_request_id uuid
+)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $function$
+DECLARE
+  v_phone public.phones%ROWTYPE;
+  v_customer_id uuid := p_customer_id;
+  v_sale_id uuid := gen_random_uuid();
+  v_invoice_no text;
+  v_sale_date timestamptz := COALESCE(p_sale_date, now());
+  v_invoice_prefix text;
+  v_net numeric;
+  v_allocations jsonb;
+  v_sale public.sales%ROWTYPE;
+BEGIN
+  IF auth.uid() IS NULL THEN RAISE EXCEPTION 'Sign in is required.'; END IF;
+  IF p_request_id IS NULL THEN RAISE EXCEPTION 'Transaction request ID is required.'; END IF;
+  PERFORM pg_advisory_xact_lock(hashtext(p_request_id::text)::bigint);
+  SELECT * INTO v_sale FROM public.sales WHERE client_request_id = p_request_id;
+  IF FOUND THEN
+    RETURN jsonb_build_object('sale_id', v_sale.id, 'invoice_no', v_sale.invoice_no,
+      'customer_id', v_sale.customer_id, 'gross_profit', v_sale.gross_profit_snapshot);
+  END IF;
+  SELECT * INTO v_phone FROM public.phones WHERE id = p_phone_id FOR UPDATE;
+  IF NOT FOUND OR v_phone.status <> 'Available' OR v_phone.archived_at IS NOT NULL THEN
+    RAISE EXCEPTION 'This phone is no longer available for sale.';
+  END IF;
+  IF p_selling_price IS NULL OR p_selling_price <= 0 OR p_selling_price <> round(p_selling_price, 2)
+      OR p_discount IS NULL OR p_discount < 0 OR p_discount >= p_selling_price
+      OR p_discount <> round(p_discount, 2)
+     OR COALESCE(p_warranty_days, 0) < 0 THEN
+    RAISE EXCEPTION 'Sale price, discount, or warranty value is invalid.';
+  END IF;
+  v_net := p_selling_price - p_discount;
+  v_allocations := public.normalize_payment_allocations(COALESCE(p_payment_allocations, '[]'::jsonb), v_net);
+
+  IF v_customer_id IS NOT NULL THEN
+    PERFORM 1 FROM public.customers WHERE id = v_customer_id;
+    IF NOT FOUND THEN RAISE EXCEPTION 'Selected customer was not found.'; END IF;
+  ELSIF NULLIF(BTRIM(p_customer_name), '') IS NOT NULL THEN
+    IF NULLIF(BTRIM(p_customer_phone), '') IS NOT NULL THEN
+      PERFORM pg_advisory_xact_lock(hashtext(BTRIM(p_customer_phone))::bigint);
+      SELECT id INTO v_customer_id FROM public.customers
+      WHERE phone = BTRIM(p_customer_phone)
+      ORDER BY created_at DESC LIMIT 1;
+    END IF;
+    IF v_customer_id IS NULL THEN
+      INSERT INTO public.customers (id, name, phone, notes, created_at)
+      VALUES (gen_random_uuid(), BTRIM(p_customer_name), NULLIF(BTRIM(p_customer_phone), ''), NULL, now())
+      RETURNING id INTO v_customer_id;
+    END IF;
+  END IF;
+
+  IF EXISTS (
+    SELECT 1 FROM jsonb_array_elements(v_allocations) AS x(item)
+    WHERE item ->> 'account' = 'Due'
+  ) AND v_customer_id IS NULL THEN
+    RAISE EXCEPTION 'A customer name is required when any sale amount is due.';
+  END IF;
+
+  SELECT setting_value #>> '{}' INTO v_invoice_prefix
+  FROM public.business_settings WHERE setting_key = 'invoice_prefix';
+  v_invoice_prefix := COALESCE(NULLIF(BTRIM(v_invoice_prefix), ''), 'RJ-');
+
+  LOOP
+    v_invoice_no := v_invoice_prefix || to_char(v_sale_date, 'YYYYMMDD') || '-'
+      || lpad(nextval('public.sales_invoice_seq')::text, 8, '0');
+    EXIT WHEN NOT EXISTS (SELECT 1 FROM public.sales WHERE invoice_no = v_invoice_no);
+  END LOOP;
+
+  INSERT INTO public.sales (
+    id, client_request_id, phone_id, customer_id, selling_price, discount, payment_mode, invoice_no,
+    sale_date, warranty_days, notes, payment_allocations,
+    purchase_cost_snapshot, repair_cost_snapshot, other_cost_snapshot,
+    total_cost_snapshot, gross_profit_snapshot, margin_percent_snapshot, created_at
+  ) VALUES (
+    v_sale_id, p_request_id, p_phone_id, v_customer_id, p_selling_price, p_discount,
+    public.payment_mode_for_allocations(v_allocations), v_invoice_no,
+    v_sale_date, COALESCE(p_warranty_days, 0), NULLIF(BTRIM(p_notes), ''), v_allocations,
+    v_phone.purchase_price, v_phone.repair_cost, v_phone.other_cost,
+    COALESCE(v_phone.purchase_price, 0) + COALESCE(v_phone.repair_cost, 0) + COALESCE(v_phone.other_cost, 0),
+    v_net - (COALESCE(v_phone.purchase_price, 0) + COALESCE(v_phone.repair_cost, 0) + COALESCE(v_phone.other_cost, 0)),
+    ((v_net - (COALESCE(v_phone.purchase_price, 0) + COALESCE(v_phone.repair_cost, 0) + COALESCE(v_phone.other_cost, 0))) / v_net) * 100,
+    now()
+  ) RETURNING * INTO v_sale;
+
+  RETURN jsonb_build_object(
+    'sale_id', v_sale.id, 'invoice_no', v_sale.invoice_no,
+    'customer_id', v_sale.customer_id, 'gross_profit', v_sale.gross_profit_snapshot
+  );
+END;
+$function$;
+
+CREATE OR REPLACE FUNCTION public.record_customer_collection(
+  p_receivable_id uuid, p_amount numeric, p_payment_mode text,
+  p_collection_date timestamptz, p_notes text, p_request_id uuid
+)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $function$
+DECLARE
+  v_due public.customer_receivables%ROWTYPE;
+  v_existing public.customer_collections%ROWTYPE;
+  v_id uuid := gen_random_uuid();
+  v_date timestamptz := COALESCE(p_collection_date, now());
+BEGIN
+  IF auth.uid() IS NULL THEN RAISE EXCEPTION 'Sign in is required.'; END IF;
+  IF p_request_id IS NULL THEN RAISE EXCEPTION 'Transaction request ID is required.'; END IF;
+  PERFORM pg_advisory_xact_lock(hashtext(p_request_id::text)::bigint);
+  SELECT * INTO v_existing FROM public.customer_collections WHERE client_request_id = p_request_id;
+  IF FOUND THEN
+    SELECT * INTO v_due FROM public.customer_receivables WHERE id = v_existing.receivable_id;
+    RETURN jsonb_build_object('collection_id', v_existing.id, 'remaining_due', v_due.balance);
+  END IF;
+  IF p_payment_mode NOT IN ('Cash', 'UPI', 'Bank') OR p_amount IS NULL OR p_amount <= 0 OR p_amount <> round(p_amount, 2)
+     OR p_amount::text IN ('NaN', 'Infinity', '-Infinity') THEN
+    RAISE EXCEPTION 'Collection amount or payment account is invalid.';
+  END IF;
+  SELECT * INTO v_due FROM public.customer_receivables WHERE id = p_receivable_id FOR UPDATE;
+  IF NOT FOUND OR p_amount > v_due.balance THEN RAISE EXCEPTION 'Collection exceeds the remaining customer due.'; END IF;
+
+  INSERT INTO public.customer_collections (id, client_request_id, receivable_id, customer_id, amount, payment_mode, collection_date, notes, created_by)
+  VALUES (v_id, p_request_id, v_due.id, v_due.customer_id, p_amount, p_payment_mode, v_date, NULLIF(BTRIM(p_notes), ''), auth.uid());
+  UPDATE public.customer_receivables
+  SET balance = balance - p_amount,
+      closed_at = CASE WHEN balance - p_amount = 0 THEN now() ELSE NULL END
+  WHERE id = v_due.id;
+  INSERT INTO public.money_transactions (transaction_type, category, amount, payment_mode, reference_id, transaction_date, notes)
+  VALUES ('Income', 'Customer Collection', p_amount, p_payment_mode, v_id, v_date, NULLIF(BTRIM(p_notes), ''));
+  RETURN jsonb_build_object('collection_id', v_id, 'remaining_due', v_due.balance - p_amount);
+END;
+$function$;
+
+CREATE OR REPLACE FUNCTION public.record_supplier_payment(
+  p_payable_id uuid, p_amount numeric, p_payment_mode text,
+  p_payment_date timestamptz, p_notes text, p_request_id uuid
+)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $function$
+DECLARE
+  v_due public.supplier_payables%ROWTYPE;
+  v_existing public.supplier_payments%ROWTYPE;
+  v_id uuid := gen_random_uuid();
+  v_date timestamptz := COALESCE(p_payment_date, now());
+BEGIN
+  IF auth.uid() IS NULL THEN RAISE EXCEPTION 'Sign in is required.'; END IF;
+  IF p_request_id IS NULL THEN RAISE EXCEPTION 'Transaction request ID is required.'; END IF;
+  PERFORM pg_advisory_xact_lock(hashtext(p_request_id::text)::bigint);
+  SELECT * INTO v_existing FROM public.supplier_payments WHERE client_request_id = p_request_id;
+  IF FOUND THEN
+    SELECT * INTO v_due FROM public.supplier_payables WHERE id = v_existing.payable_id;
+    RETURN jsonb_build_object('payment_id', v_existing.id, 'remaining_payable', v_due.balance);
+  END IF;
+  IF p_payment_mode NOT IN ('Cash', 'UPI', 'Bank') OR p_amount IS NULL OR p_amount <= 0 OR p_amount <> round(p_amount, 2)
+     OR p_amount::text IN ('NaN', 'Infinity', '-Infinity') THEN
+    RAISE EXCEPTION 'Payment amount or account is invalid.';
+  END IF;
+  SELECT * INTO v_due FROM public.supplier_payables WHERE id = p_payable_id FOR UPDATE;
+  IF NOT FOUND OR p_amount > v_due.balance THEN RAISE EXCEPTION 'Payment exceeds the remaining supplier payable.'; END IF;
+
+  INSERT INTO public.supplier_payments (id, client_request_id, payable_id, supplier_id, amount, payment_mode, payment_date, notes, created_by)
+  VALUES (v_id, p_request_id, v_due.id, v_due.supplier_id, p_amount, p_payment_mode, v_date, NULLIF(BTRIM(p_notes), ''), auth.uid());
+  UPDATE public.supplier_payables
+  SET balance = balance - p_amount,
+      closed_at = CASE WHEN balance - p_amount = 0 THEN now() ELSE NULL END
+  WHERE id = v_due.id;
+  INSERT INTO public.money_transactions (transaction_type, category, amount, payment_mode, reference_id, transaction_date, notes)
+  VALUES ('Expense', 'Supplier Payable Payment', p_amount, p_payment_mode, v_id, v_date, NULLIF(BTRIM(p_notes), ''));
+  RETURN jsonb_build_object('payment_id', v_id, 'remaining_payable', v_due.balance - p_amount);
+END;
+$function$;
+
+CREATE OR REPLACE FUNCTION public.record_internal_transfer(
+  p_from_account text, p_to_account text, p_amount numeric,
+  p_transfer_date timestamptz, p_notes text, p_request_id uuid
+)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $function$
+DECLARE
+  v_id uuid := gen_random_uuid();
+  v_existing_id uuid;
+  v_date timestamptz := COALESCE(p_transfer_date, now());
+BEGIN
+  IF auth.uid() IS NULL THEN RAISE EXCEPTION 'Sign in is required.'; END IF;
+  IF p_request_id IS NULL THEN RAISE EXCEPTION 'Transaction request ID is required.'; END IF;
+  PERFORM pg_advisory_xact_lock(hashtext(p_request_id::text)::bigint);
+  SELECT id INTO v_existing_id FROM public.internal_transfers WHERE client_request_id = p_request_id;
+  IF FOUND THEN RETURN jsonb_build_object('transfer_id', v_existing_id); END IF;
+  IF p_from_account NOT IN ('Cash', 'UPI', 'Bank') OR p_to_account NOT IN ('Cash', 'UPI', 'Bank')
+     OR p_from_account = p_to_account OR p_amount IS NULL OR p_amount <= 0 OR p_amount <> round(p_amount, 2)
+     OR p_amount::text IN ('NaN', 'Infinity', '-Infinity') THEN
+    RAISE EXCEPTION 'Transfer accounts or amount are invalid.';
+  END IF;
+  INSERT INTO public.internal_transfers (id, client_request_id, from_account, to_account, amount, transfer_date, notes, created_by)
+  VALUES (v_id, p_request_id, p_from_account, p_to_account, p_amount, v_date, NULLIF(BTRIM(p_notes), ''), auth.uid());
+  INSERT INTO public.money_transactions (transaction_type, category, amount, payment_mode, reference_id, transaction_date, notes)
+  VALUES ('Expense', 'Internal Transfer Out', p_amount, p_from_account, v_id, v_date, 'Transfer to ' || p_to_account);
+  INSERT INTO public.money_transactions (transaction_type, category, amount, payment_mode, reference_id, transaction_date, notes)
+  VALUES ('Income', 'Internal Transfer In', p_amount, p_to_account, v_id, v_date, 'Transfer from ' || p_from_account);
+  RETURN jsonb_build_object('transfer_id', v_id);
+END;
+$function$;
+
+CREATE OR REPLACE FUNCTION public.return_sale_atomic(p_sale_id uuid, p_notes text DEFAULT NULL)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $function$
+DECLARE
+  v_sale public.sales%ROWTYPE;
+  v_receivable public.customer_receivables%ROWTYPE;
+  v_has_receivable boolean := false;
+  v_refund numeric;
+  v_refunds jsonb;
+  v_item jsonb;
+  v_return_id uuid := gen_random_uuid();
+  v_previous_lifecycle_setting text;
+BEGIN
+  IF auth.uid() IS NULL THEN RAISE EXCEPTION 'Sign in is required.'; END IF;
+  SELECT * INTO v_sale FROM public.sales WHERE id = p_sale_id FOR UPDATE;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Sale was not found or was already returned.';
+  END IF;
+  IF v_sale.returned_at IS NOT NULL
+     OR EXISTS (SELECT 1 FROM public.sale_returns WHERE sale_id = v_sale.id) THEN
+    RAISE EXCEPTION 'Sale was not found or was already returned.';
+  END IF;
+  PERFORM 1 FROM public.phones WHERE id = v_sale.phone_id FOR UPDATE;
+  IF EXISTS (
+    SELECT 1 FROM public.repairs
+    WHERE phone_id = v_sale.phone_id AND lower(status) IN ('pending', 'in progress')
+  ) THEN
+    RAISE EXCEPTION 'Complete or cancel the active repair before returning this phone to available stock.';
+  END IF;
+
+  SELECT * INTO v_receivable FROM public.customer_receivables WHERE sale_id = v_sale.id FOR UPDATE;
+  v_has_receivable := FOUND;
+  IF (jsonb_array_length(COALESCE(v_sale.payment_allocations, '[]'::jsonb)) = 0
+      AND v_sale.payment_mode = 'Due')
+     OR (jsonb_array_length(COALESCE(v_sale.payment_allocations, '[]'::jsonb)) > 0
+      AND EXISTS (
+        SELECT 1 FROM jsonb_array_elements(v_sale.payment_allocations) AS x(item)
+        WHERE item ->> 'account' = 'Due'
+      ) AND NOT v_has_receivable) THEN
+    RAISE EXCEPTION 'This sale has an unverified due balance. Reconcile its payment history before returning it.';
+  END IF;
+  v_refund := (v_sale.selling_price - v_sale.discount)
+    - CASE WHEN v_has_receivable THEN v_receivable.balance ELSE 0 END;
+  IF v_refund < 0 THEN
+    RAISE EXCEPTION 'The recorded customer due exceeds the sale total. Reconcile the balance before returning it.';
+  END IF;
+
+  SELECT COALESCE(jsonb_agg(jsonb_build_object('account', account, 'amount', amount) ORDER BY account), '[]'::jsonb)
+  INTO v_refunds
+  FROM (
+    SELECT account, SUM(amount) AS amount
+    FROM (
+      SELECT item ->> 'account' AS account, (item ->> 'amount')::numeric AS amount
+      FROM jsonb_array_elements(COALESCE(v_sale.payment_allocations, '[]'::jsonb)) AS x(item)
+      WHERE item ->> 'account' IN ('Cash', 'UPI', 'Bank')
+      UNION ALL
+      SELECT CASE WHEN v_sale.payment_mode = 'Mixed' THEN 'Cash' ELSE v_sale.payment_mode END,
+        v_sale.selling_price - v_sale.discount
+      WHERE jsonb_array_length(COALESCE(v_sale.payment_allocations, '[]'::jsonb)) = 0
+        AND v_sale.payment_mode IN ('Cash', 'UPI', 'Bank', 'Mixed')
+      UNION ALL
+      SELECT payment_mode AS account, amount
+      FROM public.customer_collections
+      WHERE receivable_id = v_receivable.id
+    ) AS received
+    GROUP BY account
+  ) AS totals;
+
+  IF COALESCE((
+    SELECT SUM((item ->> 'amount')::numeric)
+    FROM jsonb_array_elements(v_refunds) AS x(item)
+  ), 0) <> v_refund THEN
+    RAISE EXCEPTION 'Recorded payment allocations do not match the refundable amount. Reconcile before returning it.';
+  END IF;
+
+  INSERT INTO public.sale_returns (id, sale_id, phone_id, refund_amount, refund_allocations, notes, created_by)
+  VALUES (v_return_id, v_sale.id, v_sale.phone_id, v_refund, v_refunds, NULLIF(BTRIM(p_notes), ''), auth.uid());
+
+  FOR v_item IN SELECT value FROM jsonb_array_elements(v_refunds) AS x(value) LOOP
+    INSERT INTO public.money_transactions (transaction_type, category, amount, payment_mode, reference_id, transaction_date, notes)
+    VALUES ('Expense', 'Sale Refund', (v_item ->> 'amount')::numeric, v_item ->> 'account', v_return_id, now(), 'Refund for invoice ' || v_sale.invoice_no);
+  END LOOP;
+
+  IF v_has_receivable THEN
+    UPDATE public.customer_receivables SET balance = 0, closed_at = now() WHERE id = v_receivable.id;
+  END IF;
+  UPDATE public.sales SET returned_at = now() WHERE id = v_sale.id;
+  v_previous_lifecycle_setting := current_setting('rj.lifecycle_write', true);
+  PERFORM set_config('rj.lifecycle_write', 'on', true);
+  UPDATE public.phones SET status = 'Available', archived_at = NULL, updated_at = now() WHERE id = v_sale.phone_id;
+  PERFORM set_config('rj.lifecycle_write', COALESCE(v_previous_lifecycle_setting, ''), true);
+  INSERT INTO public.stock_movements (phone_id, movement_type, quantity, reference_id, movement_date, notes)
+  VALUES (v_sale.phone_id, 'Return', 1, v_return_id, now(), 'Returned sale ' || v_sale.invoice_no);
+
+  RETURN jsonb_build_object('return_id', v_return_id, 'refund_amount', v_refund, 'refund_allocations', v_refunds);
+END;
+$function$;
+
+CREATE OR REPLACE FUNCTION public.archive_phone_atomic(p_phone_id uuid, p_reason text DEFAULT NULL)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $function$
+DECLARE
+  v_phone public.phones%ROWTYPE;
+  v_previous_lifecycle_setting text;
+BEGIN
+  IF auth.uid() IS NULL THEN RAISE EXCEPTION 'Sign in is required.'; END IF;
+  SELECT * INTO v_phone FROM public.phones WHERE id = p_phone_id FOR UPDATE;
+  IF NOT FOUND OR v_phone.status <> 'Available' OR v_phone.archived_at IS NOT NULL THEN
+    RAISE EXCEPTION 'Only an available, non-archived phone can be archived.';
+  END IF;
+  IF EXISTS (
+    SELECT 1 FROM public.repairs
+    WHERE phone_id = p_phone_id AND lower(status) IN ('pending', 'in progress')
+  ) THEN RAISE EXCEPTION 'A phone with an active repair cannot be archived.'; END IF;
+
+  v_previous_lifecycle_setting := current_setting('rj.lifecycle_write', true);
+  PERFORM set_config('rj.lifecycle_write', 'on', true);
+  UPDATE public.phones SET archived_at = now(), archived_reason = NULLIF(BTRIM(p_reason), ''), updated_at = now()
+  WHERE id = p_phone_id;
+  PERFORM set_config('rj.lifecycle_write', COALESCE(v_previous_lifecycle_setting, ''), true);
+  INSERT INTO public.stock_movements (phone_id, movement_type, quantity, reference_id, movement_date, notes)
+  VALUES (p_phone_id, 'Archive', -1, p_phone_id, now(), NULLIF(BTRIM(p_reason), ''));
+  RETURN jsonb_build_object('phone_id', p_phone_id, 'archived_at', now());
+END;
+$function$;
+
+CREATE OR REPLACE FUNCTION public.restore_phone_atomic(p_phone_id uuid)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $function$
+DECLARE
+  v_phone public.phones%ROWTYPE;
+  v_previous_lifecycle_setting text;
+BEGIN
+  IF auth.uid() IS NULL THEN RAISE EXCEPTION 'Sign in is required.'; END IF;
+  SELECT * INTO v_phone FROM public.phones WHERE id = p_phone_id FOR UPDATE;
+  IF NOT FOUND OR v_phone.archived_at IS NULL THEN RAISE EXCEPTION 'Archived phone was not found.'; END IF;
+  v_previous_lifecycle_setting := current_setting('rj.lifecycle_write', true);
+  PERFORM set_config('rj.lifecycle_write', 'on', true);
+  UPDATE public.phones SET archived_at = NULL, archived_reason = NULL, status = 'Available', updated_at = now()
+  WHERE id = p_phone_id;
+  PERFORM set_config('rj.lifecycle_write', COALESCE(v_previous_lifecycle_setting, ''), true);
+  INSERT INTO public.stock_movements (phone_id, movement_type, quantity, reference_id, movement_date, notes)
+  VALUES (p_phone_id, 'Restore', 1, p_phone_id, now(), 'Phone restored from archive');
+  RETURN jsonb_build_object('phone_id', p_phone_id, 'status', 'Available');
+END;
+$function$;
+
+CREATE OR REPLACE FUNCTION public.sync_repair_cost()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $function$
+DECLARE
+  v_cost numeric;
+BEGIN
+  IF NEW.parts_cost < 0 OR NEW.labour_cost < 0
+     OR NEW.parts_cost::text IN ('NaN', 'Infinity', '-Infinity')
+     OR NEW.labour_cost::text IN ('NaN', 'Infinity', '-Infinity')
+     OR NEW.parts_cost <> round(NEW.parts_cost, 2)
+     OR NEW.labour_cost <> round(NEW.labour_cost, 2) THEN
+    RAISE EXCEPTION 'Repair labour and parts costs must be finite non-negative amounts with at most two decimal places.';
+  END IF;
+  IF TG_OP = 'INSERT' THEN
+    IF NEW.status = 'Completed' THEN
+      v_cost := COALESCE(NEW.parts_cost, 0) + COALESCE(NEW.labour_cost, 0);
+      UPDATE public.phones SET repair_cost = COALESCE(repair_cost, 0) + v_cost, updated_at = now()
+      WHERE id = NEW.phone_id;
+    END IF;
+    RETURN NEW;
+  END IF;
+
+  IF OLD.status = 'Completed' THEN
+    IF NEW.status <> 'Completed' OR NEW.phone_id IS DISTINCT FROM OLD.phone_id
+       OR NEW.parts_cost IS DISTINCT FROM OLD.parts_cost
+       OR NEW.labour_cost IS DISTINCT FROM OLD.labour_cost THEN
+      RAISE EXCEPTION 'Completed repair costs and status are locked to prevent duplicate accounting. Use an audited adjustment.';
+    END IF;
+    RETURN NEW;
+  END IF;
+
+  IF NEW.status = 'Completed' THEN
+    v_cost := COALESCE(NEW.parts_cost, 0) + COALESCE(NEW.labour_cost, 0);
+    UPDATE public.phones SET repair_cost = COALESCE(repair_cost, 0) + v_cost, updated_at = now()
+    WHERE id = NEW.phone_id;
+  END IF;
+  RETURN NEW;
+END;
+$function$;
+
+CREATE OR REPLACE FUNCTION public.prepare_repair_lifecycle()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $function$
+DECLARE
+  v_phone public.phones%ROWTYPE;
+  v_status text;
+  v_previous_lifecycle_setting text;
+BEGIN
+  IF auth.uid() IS NULL THEN RAISE EXCEPTION 'Sign in is required to record a repair.'; END IF;
+  IF NEW.labour_cost < 0 OR NEW.parts_cost < 0
+     OR NEW.labour_cost::text IN ('NaN', 'Infinity', '-Infinity')
+     OR NEW.parts_cost::text IN ('NaN', 'Infinity', '-Infinity')
+     OR NEW.labour_cost <> round(NEW.labour_cost, 2)
+     OR NEW.parts_cost <> round(NEW.parts_cost, 2) THEN
+    RAISE EXCEPTION 'Repair labour and parts costs must be finite non-negative amounts with at most two decimal places.';
+  END IF;
+  v_status := lower(btrim(NEW.status));
+  IF v_status NOT IN ('pending', 'in progress', 'completed', 'cancelled') THEN
+    RAISE EXCEPTION 'Repair status must be Pending, In Progress, Completed, or Cancelled.';
+  END IF;
+
+  IF TG_OP = 'INSERT' THEN
+    IF v_status <> 'pending' THEN RAISE EXCEPTION 'A new repair must start as Pending.'; END IF;
+    IF NEW.id IS NULL THEN NEW.id := gen_random_uuid(); END IF;
+    SELECT * INTO v_phone FROM public.phones WHERE id = NEW.phone_id FOR UPDATE;
+    IF NOT FOUND OR v_phone.archived_at IS NOT NULL OR v_phone.status NOT IN ('Available', 'Sold') THEN
+      RAISE EXCEPTION 'Repairs can only be started for an available or sold, non-archived phone.';
+    END IF;
+    IF EXISTS (
+      SELECT 1 FROM public.repairs
+      WHERE phone_id = NEW.phone_id AND lower(status) IN ('pending', 'in progress')
+    ) THEN RAISE EXCEPTION 'This phone already has an active repair.'; END IF;
+
+    NEW.status := 'Pending';
+    NEW.phone_status_before_repair := v_phone.status;
+    IF v_phone.status = 'Available' THEN
+      v_previous_lifecycle_setting := current_setting('rj.lifecycle_write', true);
+      PERFORM set_config('rj.lifecycle_write', 'on', true);
+      UPDATE public.phones SET status = 'Repair', updated_at = now() WHERE id = NEW.phone_id;
+      PERFORM set_config('rj.lifecycle_write', COALESCE(v_previous_lifecycle_setting, ''), true);
+    END IF;
+    INSERT INTO public.stock_movements (phone_id, movement_type, quantity, reference_id, movement_date, notes)
+    VALUES (NEW.phone_id, 'Repair Out', CASE WHEN v_phone.status = 'Available' THEN -1 ELSE 0 END,
+      NEW.id, COALESCE(NEW.started_at, now()), 'Phone sent to repair');
+    RETURN NEW;
+  END IF;
+
+  IF NEW.phone_id IS DISTINCT FROM OLD.phone_id THEN
+    RAISE EXCEPTION 'A repair cannot be moved to another phone after creation.';
+  END IF;
+  IF lower(OLD.status) IN ('completed', 'cancelled') THEN
+    IF NEW.status IS DISTINCT FROM OLD.status
+       OR NEW.labour_cost IS DISTINCT FROM OLD.labour_cost
+       OR NEW.parts_cost IS DISTINCT FROM OLD.parts_cost THEN
+      RAISE EXCEPTION 'Completed or cancelled repair status and costs are locked. Use an audited adjustment.';
+    END IF;
+    NEW.phone_status_before_repair := OLD.phone_status_before_repair;
+    RETURN NEW;
+  END IF;
+
+  NEW.status := CASE v_status
+    WHEN 'pending' THEN 'Pending'
+    WHEN 'in progress' THEN 'In Progress'
+    WHEN 'completed' THEN 'Completed'
+    ELSE 'Cancelled'
+  END;
+  NEW.phone_status_before_repair := OLD.phone_status_before_repair;
+  RETURN NEW;
+END;
+$function$;
+
+CREATE OR REPLACE FUNCTION public.finish_repair_lifecycle()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $function$
+DECLARE
+  v_restore_status text;
+  v_current_status text;
+  v_previous_lifecycle_setting text;
+BEGIN
+  IF lower(OLD.status) NOT IN ('pending', 'in progress')
+     OR lower(NEW.status) NOT IN ('completed', 'cancelled') THEN
+    RETURN NULL;
+  END IF;
+
+  -- Older repairs have no recorded pre-repair status. Keep their existing phone state
+  -- and cost behavior; do not invent a stock movement while completing their history.
+  IF NEW.phone_status_before_repair IS NULL THEN RETURN NULL; END IF;
+  v_restore_status := NEW.phone_status_before_repair;
+  SELECT status INTO v_current_status FROM public.phones WHERE id = NEW.phone_id FOR UPDATE;
+  IF NOT FOUND THEN RAISE EXCEPTION 'The phone linked to this repair no longer exists.'; END IF;
+  IF v_current_status = 'Repair' THEN
+    v_previous_lifecycle_setting := current_setting('rj.lifecycle_write', true);
+    PERFORM set_config('rj.lifecycle_write', 'on', true);
+    UPDATE public.phones SET status = v_restore_status, updated_at = now() WHERE id = NEW.phone_id;
+    PERFORM set_config('rj.lifecycle_write', COALESCE(v_previous_lifecycle_setting, ''), true);
+  END IF;
+  INSERT INTO public.stock_movements (phone_id, movement_type, quantity, reference_id, movement_date, notes)
+  VALUES (NEW.phone_id, 'Repair In', CASE WHEN v_restore_status = 'Available' THEN 1 ELSE 0 END,
+    NEW.id, COALESCE(NEW.completed_at, now()),
+    CASE WHEN lower(NEW.status) = 'completed' THEN 'Repair completed; phone returned to its prior lifecycle state'
+      ELSE 'Repair cancelled; phone returned to its prior lifecycle state' END);
+  RETURN NULL;
+END;
+$function$;
+
+CREATE OR REPLACE FUNCTION public.prevent_phone_status_during_repair()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $function$
+BEGIN
+  IF NEW.status IS DISTINCT FROM OLD.status AND NEW.status <> 'Repair'
+     AND EXISTS (
+       SELECT 1 FROM public.repairs
+       WHERE phone_id = NEW.id AND lower(status) IN ('pending', 'in progress')
+     ) THEN
+    RAISE EXCEPTION 'Phone status cannot leave Repair while an active repair exists.';
+  END IF;
+  RETURN NEW;
+END;
+$function$;
+
+CREATE OR REPLACE FUNCTION public.guard_phone_lifecycle_update()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $function$
+BEGIN
+  IF (NEW.status IS DISTINCT FROM OLD.status OR NEW.archived_at IS DISTINCT FROM OLD.archived_at)
+     AND current_setting('rj.lifecycle_write', true) IS DISTINCT FROM 'on' THEN
+    RAISE EXCEPTION 'Phone status and archive changes must use the audited sale, repair, return, archive, or restore workflow.';
+  END IF;
+  RETURN NEW;
+END;
+$function$;
+
+CREATE OR REPLACE FUNCTION public.audit_business_row()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $function$
+DECLARE
+  v_old jsonb;
+  v_new jsonb;
+  v_id text;
+BEGIN
+  IF TG_OP <> 'INSERT' THEN
+    v_old := to_jsonb(OLD) - ARRAY['seller_photo_url', 'id_proof_front_url', 'id_proof_back_url']::text[];
+  END IF;
+  IF TG_OP <> 'DELETE' THEN
+    v_new := to_jsonb(NEW) - ARRAY['seller_photo_url', 'id_proof_front_url', 'id_proof_back_url']::text[];
+    v_id := COALESCE(v_new ->> 'id', v_new ->> 'setting_key', v_new ->> 'account');
+  ELSE
+    v_id := COALESCE(v_old ->> 'id', v_old ->> 'setting_key', v_old ->> 'account');
+  END IF;
+  INSERT INTO public.audit_log (action, entity, entity_id, old_data, new_data, user_id)
+  VALUES (TG_OP, TG_TABLE_NAME, v_id, v_old, v_new, auth.uid());
+  RETURN NULL;
+END;
+$function$;
+
+CREATE OR REPLACE FUNCTION public.prevent_phone_delete()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $function$
+BEGIN
+  RAISE EXCEPTION 'Phone records are audit history and cannot be deleted. Archive the phone instead.';
+END;
+$function$;
+
+CREATE OR REPLACE FUNCTION public.prevent_sale_delete()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $function$
+BEGIN
+  RAISE EXCEPTION 'Sales cannot be deleted. Use the return workflow to preserve the audit trail.';
+END;
+$function$;
+
+DO $triggers$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'trg_prepare_repair_lifecycle' AND tgrelid = 'public.repairs'::regclass AND NOT tgisinternal) THEN
+    CREATE TRIGGER trg_prepare_repair_lifecycle BEFORE INSERT OR UPDATE ON public.repairs
+      FOR EACH ROW EXECUTE FUNCTION public.prepare_repair_lifecycle();
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'trg_finish_repair_lifecycle' AND tgrelid = 'public.repairs'::regclass AND NOT tgisinternal) THEN
+    CREATE TRIGGER trg_finish_repair_lifecycle AFTER UPDATE OF status ON public.repairs
+      FOR EACH ROW EXECUTE FUNCTION public.finish_repair_lifecycle();
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'trg_prevent_phone_status_during_repair' AND tgrelid = 'public.phones'::regclass AND NOT tgisinternal) THEN
+    CREATE TRIGGER trg_prevent_phone_status_during_repair BEFORE UPDATE OF status ON public.phones
+      FOR EACH ROW EXECUTE FUNCTION public.prevent_phone_status_during_repair();
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'trg_guard_phone_lifecycle_update' AND tgrelid = 'public.phones'::regclass AND NOT tgisinternal) THEN
+    CREATE TRIGGER trg_guard_phone_lifecycle_update BEFORE UPDATE OF status, archived_at ON public.phones
+      FOR EACH ROW EXECUTE FUNCTION public.guard_phone_lifecycle_update();
+  END IF;
+
+  IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'trg_prevent_phone_delete' AND tgrelid = 'public.phones'::regclass AND NOT tgisinternal) THEN
+    CREATE TRIGGER trg_prevent_phone_delete BEFORE DELETE ON public.phones
+      FOR EACH ROW EXECUTE FUNCTION public.prevent_phone_delete();
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'trg_prevent_sale_delete' AND tgrelid = 'public.sales'::regclass AND NOT tgisinternal) THEN
+    CREATE TRIGGER trg_prevent_sale_delete BEFORE DELETE ON public.sales
+      FOR EACH ROW EXECUTE FUNCTION public.prevent_sale_delete();
+  END IF;
+
+  IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'trg_audit_phones' AND tgrelid = 'public.phones'::regclass AND NOT tgisinternal) THEN
+    CREATE TRIGGER trg_audit_phones AFTER INSERT OR UPDATE OR DELETE ON public.phones
+      FOR EACH ROW EXECUTE FUNCTION public.audit_business_row();
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'trg_audit_sales' AND tgrelid = 'public.sales'::regclass AND NOT tgisinternal) THEN
+    CREATE TRIGGER trg_audit_sales AFTER INSERT OR UPDATE OR DELETE ON public.sales
+      FOR EACH ROW EXECUTE FUNCTION public.audit_business_row();
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'trg_audit_expenses' AND tgrelid = 'public.expenses'::regclass AND NOT tgisinternal) THEN
+    CREATE TRIGGER trg_audit_expenses AFTER INSERT OR UPDATE OR DELETE ON public.expenses
+      FOR EACH ROW EXECUTE FUNCTION public.audit_business_row();
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'trg_audit_repairs' AND tgrelid = 'public.repairs'::regclass AND NOT tgisinternal) THEN
+    CREATE TRIGGER trg_audit_repairs AFTER INSERT OR UPDATE OR DELETE ON public.repairs
+      FOR EACH ROW EXECUTE FUNCTION public.audit_business_row();
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'trg_audit_customers' AND tgrelid = 'public.customers'::regclass AND NOT tgisinternal) THEN
+    CREATE TRIGGER trg_audit_customers AFTER INSERT OR UPDATE OR DELETE ON public.customers
+      FOR EACH ROW EXECUTE FUNCTION public.audit_business_row();
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'trg_audit_suppliers' AND tgrelid = 'public.suppliers'::regclass AND NOT tgisinternal) THEN
+    CREATE TRIGGER trg_audit_suppliers AFTER INSERT OR UPDATE OR DELETE ON public.suppliers
+      FOR EACH ROW EXECUTE FUNCTION public.audit_business_row();
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'trg_audit_customer_collections' AND tgrelid = 'public.customer_collections'::regclass AND NOT tgisinternal) THEN
+    CREATE TRIGGER trg_audit_customer_collections AFTER INSERT OR UPDATE OR DELETE ON public.customer_collections
+      FOR EACH ROW EXECUTE FUNCTION public.audit_business_row();
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'trg_audit_supplier_payments' AND tgrelid = 'public.supplier_payments'::regclass AND NOT tgisinternal) THEN
+    CREATE TRIGGER trg_audit_supplier_payments AFTER INSERT OR UPDATE OR DELETE ON public.supplier_payments
+      FOR EACH ROW EXECUTE FUNCTION public.audit_business_row();
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'trg_audit_internal_transfers' AND tgrelid = 'public.internal_transfers'::regclass AND NOT tgisinternal) THEN
+    CREATE TRIGGER trg_audit_internal_transfers AFTER INSERT OR UPDATE OR DELETE ON public.internal_transfers
+      FOR EACH ROW EXECUTE FUNCTION public.audit_business_row();
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'trg_audit_sale_returns' AND tgrelid = 'public.sale_returns'::regclass AND NOT tgisinternal) THEN
+    CREATE TRIGGER trg_audit_sale_returns AFTER INSERT OR UPDATE OR DELETE ON public.sale_returns
+      FOR EACH ROW EXECUTE FUNCTION public.audit_business_row();
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'trg_audit_business_settings' AND tgrelid = 'public.business_settings'::regclass AND NOT tgisinternal) THEN
+    CREATE TRIGGER trg_audit_business_settings AFTER INSERT OR UPDATE OR DELETE ON public.business_settings
+      FOR EACH ROW EXECUTE FUNCTION public.audit_business_row();
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'trg_audit_account_opening_balances' AND tgrelid = 'public.account_opening_balances'::regclass AND NOT tgisinternal) THEN
+    CREATE TRIGGER trg_audit_account_opening_balances AFTER INSERT OR UPDATE OR DELETE ON public.account_opening_balances
+      FOR EACH ROW EXECUTE FUNCTION public.audit_business_row();
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'trg_audit_money_transactions' AND tgrelid = 'public.money_transactions'::regclass AND NOT tgisinternal) THEN
+    CREATE TRIGGER trg_audit_money_transactions AFTER INSERT OR UPDATE OR DELETE ON public.money_transactions
+      FOR EACH ROW EXECUTE FUNCTION public.audit_business_row();
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'trg_audit_customer_receivables' AND tgrelid = 'public.customer_receivables'::regclass AND NOT tgisinternal) THEN
+    CREATE TRIGGER trg_audit_customer_receivables AFTER INSERT OR UPDATE OR DELETE ON public.customer_receivables
+      FOR EACH ROW EXECUTE FUNCTION public.audit_business_row();
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'trg_audit_supplier_payables' AND tgrelid = 'public.supplier_payables'::regclass AND NOT tgisinternal) THEN
+    CREATE TRIGGER trg_audit_supplier_payables AFTER INSERT OR UPDATE OR DELETE ON public.supplier_payables
+      FOR EACH ROW EXECUTE FUNCTION public.audit_business_row();
+  END IF;
+END;
+$triggers$;
+
+ALTER TABLE public.customer_receivables ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.customer_collections ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.supplier_payables ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.supplier_payments ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.internal_transfers ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.sale_returns ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.audit_log ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.business_settings ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.account_opening_balances ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.phones ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.sales ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.customers ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.expenses ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.money_transactions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.repairs ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.stock_movements ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.suppliers ENABLE ROW LEVEL SECURITY;
+
+-- Keep legacy permissive policies intact for authenticated use, but stop anonymous
+-- clients from accessing financial/KYC-bearing business tables.
+DO $security_policies$
+DECLARE
+  v_table text;
+BEGIN
+  FOREACH v_table IN ARRAY ARRAY[
+    'phones', 'sales', 'customers', 'expenses', 'money_transactions',
+    'repairs', 'stock_movements', 'suppliers', 'customer_receivables',
+    'customer_collections', 'supplier_payables', 'supplier_payments',
+    'internal_transfers', 'sale_returns', 'audit_log', 'business_settings',
+    'account_opening_balances'
+  ] LOOP
+    IF NOT EXISTS (
+      SELECT 1 FROM pg_policies WHERE schemaname = 'public'
+        AND tablename = v_table AND policyname = v_table || '_deny_anon'
+    ) THEN
+      EXECUTE format(
+        'CREATE POLICY %I ON public.%I AS RESTRICTIVE FOR ALL TO anon USING (false) WITH CHECK (false)',
+        v_table || '_deny_anon', v_table
+      );
+    END IF;
+  END LOOP;
+END;
+$security_policies$;
+
+DO $delete_policies$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE schemaname = 'public' AND tablename = 'phones' AND policyname = 'phones_deny_delete') THEN
+    CREATE POLICY phones_deny_delete ON public.phones AS RESTRICTIVE FOR DELETE TO public USING (false);
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE schemaname = 'public' AND tablename = 'sales' AND policyname = 'sales_deny_delete') THEN
+    CREATE POLICY sales_deny_delete ON public.sales AS RESTRICTIVE FOR DELETE TO public USING (false);
+  END IF;
+END;
+$delete_policies$;
+
+DO $policies$
+DECLARE
+  v_item record;
+BEGIN
+  FOR v_item IN SELECT * FROM (VALUES
+    ('customer_receivables', 'customer_receivables_auth_select', 'SELECT'),
+    ('customer_collections', 'customer_collections_auth_select', 'SELECT'),
+    ('supplier_payables', 'supplier_payables_auth_select', 'SELECT'),
+    ('supplier_payments', 'supplier_payments_auth_select', 'SELECT'),
+    ('internal_transfers', 'internal_transfers_auth_select', 'SELECT'),
+    ('sale_returns', 'sale_returns_auth_select', 'SELECT'),
+    ('audit_log', 'audit_log_auth_select', 'SELECT'),
+    ('business_settings', 'business_settings_auth_select', 'SELECT'),
+    ('business_settings', 'business_settings_auth_insert', 'INSERT'),
+    ('business_settings', 'business_settings_auth_update', 'UPDATE'),
+    ('account_opening_balances', 'account_opening_balances_auth_select', 'SELECT'),
+    ('account_opening_balances', 'account_opening_balances_auth_insert', 'INSERT'),
+    ('account_opening_balances', 'account_opening_balances_auth_update', 'UPDATE'),
+    ('suppliers', 'suppliers_auth_select', 'SELECT'),
+    ('suppliers', 'suppliers_auth_insert', 'INSERT'),
+    ('suppliers', 'suppliers_auth_update', 'UPDATE')
+  ) AS policy_specs(table_name, policy_name, command_name) LOOP
+    IF NOT EXISTS (
+      SELECT 1 FROM pg_policies
+      WHERE schemaname = 'public' AND tablename = v_item.table_name AND policyname = v_item.policy_name
+    ) THEN
+      IF v_item.command_name = 'SELECT' THEN
+        EXECUTE format('CREATE POLICY %I ON public.%I FOR SELECT TO authenticated USING (true)', v_item.policy_name, v_item.table_name);
+      ELSIF v_item.command_name = 'INSERT' THEN
+        EXECUTE format('CREATE POLICY %I ON public.%I FOR INSERT TO authenticated WITH CHECK (true)', v_item.policy_name, v_item.table_name);
+      ELSIF v_item.command_name = 'UPDATE' THEN
+        EXECUTE format('CREATE POLICY %I ON public.%I FOR UPDATE TO authenticated USING (true) WITH CHECK (true)', v_item.policy_name, v_item.table_name);
+      END IF;
+    END IF;
+  END LOOP;
+END;
+$policies$;
+
+-- Authenticated application access. The restrictive anonymous policies above
+-- override the legacy anon/public policies while preserving authenticated use.
+DO $authenticated_policies$
+DECLARE
+  v_item record;
+BEGIN
+  FOR v_item IN SELECT * FROM (VALUES
+    ('phones', 'phones_auth_select', 'SELECT'),
+    ('phones', 'phones_auth_insert', 'INSERT'),
+    ('phones', 'phones_auth_update', 'UPDATE'),
+    ('sales', 'sales_auth_select', 'SELECT'),
+    ('sales', 'sales_auth_insert', 'INSERT'),
+    ('customers', 'customers_auth_select', 'SELECT'),
+    ('customers', 'customers_auth_insert', 'INSERT'),
+    ('customers', 'customers_auth_update', 'UPDATE'),
+    ('expenses', 'expenses_auth_select', 'SELECT'),
+    ('expenses', 'expenses_auth_insert', 'INSERT'),
+    ('money_transactions', 'money_transactions_auth_select', 'SELECT'),
+    ('repairs', 'repairs_auth_select', 'SELECT'),
+    ('repairs', 'repairs_auth_insert', 'INSERT'),
+    ('repairs', 'repairs_auth_update', 'UPDATE'),
+    ('stock_movements', 'stock_movements_auth_select', 'SELECT')
+  ) AS policy_specs(table_name, policy_name, command_name) LOOP
+    IF NOT EXISTS (
+      SELECT 1 FROM pg_policies
+      WHERE schemaname = 'public' AND tablename = v_item.table_name AND policyname = v_item.policy_name
+    ) THEN
+      IF v_item.command_name = 'SELECT' THEN
+        EXECUTE format('CREATE POLICY %I ON public.%I FOR SELECT TO authenticated USING (true)', v_item.policy_name, v_item.table_name);
+      ELSIF v_item.command_name = 'INSERT' THEN
+        EXECUTE format('CREATE POLICY %I ON public.%I FOR INSERT TO authenticated WITH CHECK (true)', v_item.policy_name, v_item.table_name);
+      ELSIF v_item.command_name = 'UPDATE' THEN
+        EXECUTE format('CREATE POLICY %I ON public.%I FOR UPDATE TO authenticated USING (true) WITH CHECK (true)', v_item.policy_name, v_item.table_name);
+      END IF;
+    END IF;
+  END LOOP;
+END;
+$authenticated_policies$;
+
+-- Revoke inherited/default client privileges first, then grant only the operations
+-- used by the authenticated UI. Critical financial mutations go through RPCs/triggers.
+REVOKE ALL PRIVILEGES ON TABLE
+  public.phones, public.sales, public.customers, public.expenses,
+  public.money_transactions, public.repairs, public.stock_movements, public.suppliers,
+  public.customer_receivables, public.customer_collections, public.supplier_payables,
+  public.supplier_payments, public.internal_transfers, public.sale_returns,
+  public.audit_log, public.business_settings, public.account_opening_balances
+  FROM PUBLIC, anon, authenticated;
+
+GRANT SELECT, UPDATE ON public.phones TO authenticated;
+GRANT SELECT ON public.sales, public.expenses, public.money_transactions,
+  public.stock_movements, public.customer_receivables, public.customer_collections,
+  public.supplier_payables, public.supplier_payments, public.internal_transfers,
+  public.sale_returns, public.audit_log TO authenticated;
+GRANT SELECT, INSERT, UPDATE ON public.customers, public.repairs, public.suppliers,
+  public.business_settings, public.account_opening_balances TO authenticated;
+
+DO $trigger_function_privileges$
+DECLARE
+  v_signature text;
+BEGIN
+  FOREACH v_signature IN ARRAY ARRAY[
+    'public.validate_expense_record()',
+    'public.validate_phone_imeis()',
+    'public.prepare_phone_purchase()',
+    'public.process_phone_purchase_automations()',
+    'public.prepare_sale()',
+    'public.process_sale_automations()',
+    'public.sync_repair_cost()',
+    'public.prepare_repair_lifecycle()',
+    'public.finish_repair_lifecycle()',
+    'public.prevent_phone_status_during_repair()',
+    'public.guard_phone_lifecycle_update()',
+    'public.audit_business_row()',
+    'public.prevent_phone_delete()',
+    'public.prevent_sale_delete()',
+    'public.stamp_opening_balance_user()',
+    'public.process_phone_purchase()',
+    'public.process_expense_automation()'
+  ] LOOP
+    EXECUTE format('REVOKE ALL ON FUNCTION %s FROM PUBLIC, anon, authenticated', v_signature);
+  END LOOP;
+END;
+$trigger_function_privileges$;
+
+REVOKE ALL ON FUNCTION public.create_phone_purchase_atomic(jsonb) FROM PUBLIC, anon;
+REVOKE ALL ON FUNCTION public.create_sale_atomic(uuid, uuid, text, text, numeric, numeric, jsonb, timestamptz, integer, text, uuid) FROM PUBLIC, anon;
+REVOKE ALL ON FUNCTION public.create_expense_atomic(uuid, text, numeric, text, timestamptz, text) FROM PUBLIC, anon;
+REVOKE ALL ON FUNCTION public.record_customer_collection(uuid, numeric, text, timestamptz, text, uuid) FROM PUBLIC, anon;
+REVOKE ALL ON FUNCTION public.record_supplier_payment(uuid, numeric, text, timestamptz, text, uuid) FROM PUBLIC, anon;
+REVOKE ALL ON FUNCTION public.record_internal_transfer(text, text, numeric, timestamptz, text, uuid) FROM PUBLIC, anon;
+REVOKE ALL ON FUNCTION public.return_sale_atomic(uuid, text) FROM PUBLIC, anon;
+REVOKE ALL ON FUNCTION public.archive_phone_atomic(uuid, text) FROM PUBLIC, anon;
+REVOKE ALL ON FUNCTION public.restore_phone_atomic(uuid) FROM PUBLIC, anon;
+REVOKE ALL ON FUNCTION public.cashbook_account_summary(timestamptz, timestamptz) FROM PUBLIC, anon;
+REVOKE ALL ON FUNCTION public.stamp_opening_balance_user() FROM PUBLIC, anon;
+REVOKE ALL ON FUNCTION public.normalize_payment_allocations(jsonb, numeric) FROM PUBLIC, anon;
+REVOKE ALL ON FUNCTION public.payment_mode_for_allocations(jsonb) FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION public.create_phone_purchase_atomic(jsonb) TO authenticated;
+GRANT EXECUTE ON FUNCTION public.create_sale_atomic(uuid, uuid, text, text, numeric, numeric, jsonb, timestamptz, integer, text, uuid) TO authenticated;
+GRANT EXECUTE ON FUNCTION public.create_expense_atomic(uuid, text, numeric, text, timestamptz, text) TO authenticated;
+GRANT EXECUTE ON FUNCTION public.record_customer_collection(uuid, numeric, text, timestamptz, text, uuid) TO authenticated;
+GRANT EXECUTE ON FUNCTION public.record_supplier_payment(uuid, numeric, text, timestamptz, text, uuid) TO authenticated;
+GRANT EXECUTE ON FUNCTION public.record_internal_transfer(text, text, numeric, timestamptz, text, uuid) TO authenticated;
+GRANT EXECUTE ON FUNCTION public.return_sale_atomic(uuid, text) TO authenticated;
+GRANT EXECUTE ON FUNCTION public.archive_phone_atomic(uuid, text) TO authenticated;
+GRANT EXECUTE ON FUNCTION public.restore_phone_atomic(uuid) TO authenticated;
+GRANT EXECUTE ON FUNCTION public.cashbook_account_summary(timestamptz, timestamptz) TO authenticated;
