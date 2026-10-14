@@ -1,0 +1,31 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "RJ Staging Check Audit",
+			"type": "shell",
+			"command": "C:\\Program Files\\PostgreSQL\\18\\bin\\psql.exe",
+			"args": [
+				"-W",
+				"-X",
+				"-v",
+				"ON_ERROR_STOP=1",
+				"-h",
+				"aws-0-ap-south-1.pooler.supabase.com",
+				"-p",
+				"5432",
+				"-U",
+				"postgres.gnvtvkbgpttmzvzazwfh",
+				"-d",
+				"postgres",
+				"-P",
+				"pager=off",
+				"-c",
+				"SELECT current_database() AS database, current_user AS connected_user; SELECT n.nspname AS schema_name, t.relname AS table_name, c.conname, pg_get_constraintdef(c.oid, false) AS definition FROM pg_constraint c JOIN pg_class t ON t.oid = c.conrelid JOIN pg_namespace n ON n.oid = t.relnamespace WHERE n.nspname = $q$public$q$ AND c.contype = $q$c$q$ ORDER BY t.relname, c.conname;"
+			],
+			"isBackground": false,
+			"problemMatcher": [],
+			"group": "test"
+		}
+	]
+}
