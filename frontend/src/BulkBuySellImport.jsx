@@ -63,7 +63,7 @@ export default function BulkBuySellImport() {
     try {
       const validRows = rows.filter((r) => r.imei.trim() !== "" && r.modelName.trim() !== "");
       if (validRows.length === 0) {
-        setMessage("?? Kripya IMEI aur Model fill karein!");
+        setMessage(" Kripya IMEI aur Model fill karein!");
         setLoading(false);
         return;
       }
@@ -83,10 +83,10 @@ export default function BulkBuySellImport() {
 
       const { error } = await supabase.from("stock").insert(stockPayload);
       if (error) throw error;
-      setMessage(`? ${validRows.length} Phones System Mein Successfully Import Ho Gaye!`);
+      setMessage(` ${validRows.length} Phones System Mein Successfully Import Ho Gaye!`);
       setRows([{ imei: "", brandName: "", modelName: "", purchasePrice: "", supplierName: "", purchaseDate: new Date().toISOString().split("T")[0], sellingPrice: "", customerName: "", customerPhone: "", saleDate: "", status: "In Stock" }]);
     } catch (err) {
-      setMessage(`? Import Error: ${err.message || "Database connection issue"}`);
+      setMessage(` Import Error: ${err.message || "Database connection issue"}`);
     } finally {
       setLoading(false);
     }
@@ -94,8 +94,8 @@ export default function BulkBuySellImport() {
 
   return (
     <div style={{ padding: "20px", fontFamily: "sans-serif" }}>
-      <h2>?? Bulk Phone Buy & Sell Entry / Import Form</h2>
-      {message && <div style={{ padding: "10px", marginBottom: "15px", borderRadius: "6px", backgroundColor: message.startsWith("?") ? "#e6fffa" : "#fff5f5", border: `1px solid ${message.startsWith("?") ? "#38b2ac" : "#feb2b2"}` }}>{message}</div>}
+      <h2> Bulk Phone Buy & Sell Entry / Import Form</h2>
+      {message && <div style={{ padding: "10px", marginBottom: "15px", borderRadius: "6px", backgroundColor: message.startsWith("") ? "#e6fffa" : "#fff5f5", border: `1px solid ${message.startsWith("") ? "#38b2ac" : "#feb2b2"}` }}>{message}</div>}
       <div style={{ overflowX: "auto" }}>
         <table border="1" cellPadding="8" style={{ width: "100%", borderCollapse: "collapse", borderColor: "#ddd", textAlign: "left", fontSize: "14px" }}>
           <thead>
@@ -119,15 +119,15 @@ export default function BulkBuySellImport() {
                 <td><input type="text" placeholder="Customer" value={row.customerName} onChange={(e) => handleChange(index, "customerName", e.target.value)} style={{ width: "90px" }} /></td>
                 <td><input type="text" placeholder="Mobile" value={row.customerPhone} onChange={(e) => handleChange(index, "customerPhone", e.target.value)} style={{ width: "90px" }} /></td>
                 <td><b>{row.status}</b></td>
-                <td>{rows.length > 1 && <button onClick={() => removeRow(index)} style={{ background: "red", color: "white", border: "none" }}>?</button>}</td>
+                <td>{rows.length > 1 && <button onClick={() => removeRow(index)} style={{ background: "red", color: "white", border: "none" }}></button>}</td>
               </tr>
             ))}
           </tbody>
         </table>
       </div>
       <div style={{ marginTop: "20px", display: "flex", gap: "10px" }}>
-        <button onClick={addRow} style={{ padding: "8px 16px", background: "#3182ce", color: "white", border: "none", borderRadius: "4px" }}>? Add Row</button>
-        <button onClick={handleSystemImport} disabled={loading} style={{ padding: "8px 20px", background: "#38a169", color: "white", border: "none", borderRadius: "4px" }}>{loading ? "Importing..." : "?? Direct Import to System"}</button>
+        <button onClick={addRow} style={{ padding: "8px 16px", background: "#3182ce", color: "white", border: "none", borderRadius: "4px" }}> Add Row</button>
+        <button onClick={handleSystemImport} disabled={loading} style={{ padding: "8px 20px", background: "#38a169", color: "white", border: "none", borderRadius: "4px" }}>{loading ? "Importing..." : " Direct Import to System"}</button>
       </div>
     </div>
   );
