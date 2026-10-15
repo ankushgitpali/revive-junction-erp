@@ -16,7 +16,7 @@ import Invoices from './Invoices';
 import Pnl from './PnL';
 import AnalyticsDashboard from './components/AnalyticsDashboard'; // New Analytics HQ Component
 import Settings from './Settings';
-import OctoberHistoricalImport from './OctoberHistoricalImport';
+import AIAssistant from './AIAssistant';
 
 // Error Boundary to catch any crashing component and stop blank screen
 class ErrorBoundary extends Component {
@@ -116,7 +116,7 @@ export default function App() {
     { id: 'invoices', label: '📄 Invoices Management' },
     { id: 'pnl', label: '📈 P&L Analytics Graph' },
     { id: 'settings', label: '⚙️ Store Settings' },
-    { id: 'october-import', label: '🧾 October 2026 Historical Import' },
+    { id: 'october-import', label: '🧾  AI Control Center' },
   ];
 
   const renderModule = () => {
@@ -134,7 +134,7 @@ export default function App() {
       case 'invoices': return <Invoices />;
       case 'pnl': return <Pnl />;
       case 'settings': return <Settings />;
-      case 'october-import': return <OctoberHistoricalImport />;
+      case 'october-import': return <AIAssistant />;
       default: return <Dashboard />;
     }
   };
