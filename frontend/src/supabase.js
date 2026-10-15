@@ -20,5 +20,11 @@ export const isSupabaseConfigured = Boolean(
 );
 
 export const supabase = isSupabaseConfigured
-  ? createClient(supabaseUrl, supabaseKey)
+  ? createClient(supabaseUrl, supabaseKey, {
+      auth: {
+        persistSession: true,
+        autoRefreshToken: true, // <-- Yeh JWT expiry aur automatic token refresh handle karega
+        detectSessionInUrl: true,
+      },
+    })
   : null;
